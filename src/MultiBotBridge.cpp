@@ -163,6 +163,13 @@ struct QuestEntryData
     bool completed = false;
 };
 
+struct TalentSpecEntryData
+{
+    uint32 index = 0;
+    std::string name;
+    std::string build;
+};
+
 std::string GetRaceName(uint8 raceId)
 {
     switch (raceId)
@@ -410,6 +417,137 @@ std::string BuildPvpStatsPayload(Player* bot)
     }
 
     return out.str();
+}
+
+uint32 CountTalentLinkTreePoints(std::string const& tree)
+{
+    uint32 points = 0;
+    for (char const c : tree)
+    {
+        if (c >= '0' && c <= '9')
+            points += static_cast<uint32>(c - '0');
+    }
+
+    return points;
+}
+
+std::string BuildTalentLinkPointSummary(std::string const& link)
+{
+    std::array<std::string, 3> trees = {"", "", ""};
+    uint8 treeIndex = 0;
+
+    for (char const c : link)
+    {
+        if (c == '-')
+        {
+            if (treeIndex < 2)
+                ++treeIndex;
+            continue;
+        }
+
+        if (treeIndex < trees.size())
+            trees[treeIndex].push_back(c);
+    }
+
+    std::ostringstream out;
+    out << CountTalentLinkTreePoints(trees[0]) << '-' << CountTalentLinkTreePoints(trees[1])
+        << '-' << CountTalentLinkTreePoints(trees[2]);
+    return out.str();
+}
+
+std::string GetPremadeSpecConfigString(std::string const& key)
+{
+    return Trim(sConfigMgr->GetOption<std::string>(key, ""));
+}
+
+std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
+{
+    std::vector<uint32> levels;
+    levels.push_back(botLevel);
+    levels.push_back(80);
+    levels.push_back(70);
+    levels.push_back(60);
+    levels.push_back(40);
+    levels.push_back(20);
+
+    std::set<uint32> seen;
+    for (uint32 const level : levels)
+    {
+        if (!level || seen.find(level) != seen.end())
+            continue;
+
+        seen.insert(level);
+
+        std::ostringstream key;
+        key << "AiPlayerbot.PremadeSpecLink." << static_cast<uint32>(classId) << '.' << specIndex << '.' << level;
+
+        std::string const link = GetPremadeSpecConfigString(key.str());
+        if (!link.empty())
+            return link;
+    }
+
+    return "";
+}
+
+std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
+{
+    std::vector<TalentSpecEntryData> entries;
+    if (!bot)
+        return entries;
+
+    uint8 const classId = static_cast<uint8>(bot->getClass());
+
+    for (uint32 specIndex = 0; specIndex <= 30; ++specIndex)
+    {
+        std::ostringstream nameKey;
+        nameKey << "AiPlayerbot.PremadeSpecName." << static_cast<uint32>(classId) << '.' << specIndex;
+
+        std::string const specName = GetPremadeSpecConfigString(nameKey.str());
+        if (specName.empty())
+            continue;
+
+        TalentSpecEntryData entry;
+        entry.index = specIndex;
+        entry.name = specName;
+
+        std::string const link = GetPremadeSpecLink(classId, specIndex, bot->GetLevel());
+        if (!link.empty())
+            entry.build = BuildTalentLinkPointSummary(link);
+
+        entries.push_back(entry);
+    }
+
+    return entries;
+}
+
+void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
+{
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string const token = Trim(tokenValue);
+    Player* const bot = FindBotByName(requester, requestedBotName);
+
+    std::string const effectiveBotName = bot ? bot->GetName() : requestedBotName;
+    std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + token;
+
+    SendAddonPacket(requester, replyType, "TALENT_SPEC_BEGIN", headerPayload);
+
+    if (bot)
+    {
+        std::vector<TalentSpecEntryData> const specs = BuildTalentSpecEntries(bot);
+        for (TalentSpecEntryData const& spec : specs)
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName())
+                << kFieldSeparator << token
+                << kFieldSeparator << spec.index
+                << kFieldSeparator << UrlEncodeField(spec.name)
+                << kFieldSeparator << spec.build;
+
+            SendAddonPacket(requester, replyType, "TALENT_SPEC_ITEM", payload.str());
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "TALENT_SPEC_END", headerPayload);
 }
 
 std::string NormalizeQuestMode(std::string const& mode)
@@ -1140,6 +1278,13 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         if (requestType == "STATES")
         {
             SendStatePackets(player, replyType);
+            return true;
+        }
+
+        if (requestType == "TALENT_SPEC_LIST")
+        {
+            std::pair<std::string, std::string> const specRequest = SplitOnce(request.second, kFieldSeparator);
+            SendTalentSpecListPackets(player, replyType, specRequest.first, specRequest.second);
             return true;
         }
 
