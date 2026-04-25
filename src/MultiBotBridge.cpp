@@ -550,6 +550,111 @@ void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string
     SendAddonPacket(requester, replyType, "TALENT_SPEC_END", headerPayload);
 }
 
+uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
+{
+    if (!glyphId && !spellId)
+        return 0;
+
+    static std::map<uint32, uint32> glyphItemCache;
+    uint32 const cacheKey = glyphId ? glyphId : spellId;
+    std::map<uint32, uint32>::const_iterator const cached = glyphItemCache.find(cacheKey);
+    if (cached != glyphItemCache.end())
+        return cached->second;
+
+    uint32 itemId = 0;
+    if (spellId)
+    {
+        QueryResult direct = WorldDatabase.Query(
+            "SELECT entry FROM item_template "
+            "WHERE class = 16 AND (spellid_1 = {} OR spellid_2 = {} OR spellid_3 = {} OR spellid_4 = {} OR spellid_5 = {}) "
+            "LIMIT 1",
+            spellId, spellId, spellId, spellId, spellId);
+
+        if (direct)
+            itemId = direct->Fetch()[0].Get<uint32>();
+    }
+
+    if (!itemId && glyphId)
+    {
+        QueryResult result = WorldDatabase.Query(
+            "SELECT entry, spellid_1, spellid_2, spellid_3, spellid_4, spellid_5 "
+            "FROM item_template WHERE class = 16");
+
+        if (result)
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+
+                for (uint8 i = 0; i < 5; ++i)
+                {
+                    uint32 const itemSpellId = fields[i + 1].Get<uint32>();
+                    if (!itemSpellId)
+                        continue;
+
+                    SpellInfo const* const itemSpellInfo = sSpellMgr->GetSpellInfo(itemSpellId);
+                    if (!itemSpellInfo)
+                        continue;
+
+                    for (uint8 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+                    {
+                        if (itemSpellInfo->Effects[effectIndex].MiscValue == static_cast<int32>(glyphId))
+                        {
+                            itemId = fields[0].Get<uint32>();
+                            break;
+                        }
+                    }
+
+                    if (itemId)
+                        break;
+                }
+            } while (!itemId && result->NextRow());
+        }
+    }
+
+    glyphItemCache[cacheKey] = itemId;
+    return itemId;
+}
+
+void SendGlyphPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
+{
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string const token = Trim(tokenValue);
+    Player* const bot = FindBotByName(requester, requestedBotName);
+
+    std::string const effectiveBotName = bot ? bot->GetName() : requestedBotName;
+    std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + token;
+
+    SendAddonPacket(requester, replyType, "GLYPHS_BEGIN", headerPayload);
+
+    if (bot)
+    {
+        for (uint8 slot = 0; slot < MAX_GLYPH_SLOT_INDEX; ++slot)
+        {
+            uint32 const glyphId = bot->GetGlyph(slot);
+            if (!glyphId)
+                continue;
+
+            GlyphPropertiesEntry const* const glyph = sGlyphPropertiesStore.LookupEntry(glyphId);
+            uint32 const spellId = glyph ? glyph->SpellId : 0;
+            uint32 const itemId = FindGlyphItemId(glyphId, spellId);
+
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName())
+                << kFieldSeparator << token
+                << kFieldSeparator << static_cast<uint32>(slot + 1)
+                << kFieldSeparator << itemId
+                << kFieldSeparator << glyphId
+                << kFieldSeparator << spellId
+                << kFieldSeparator;
+
+            SendAddonPacket(requester, replyType, "GLYPHS_ITEM", payload.str());
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "GLYPHS_END", headerPayload);
+}
+
 std::string NormalizeQuestMode(std::string const& mode)
 {
     std::string normalized = ToUpper(Trim(mode));
@@ -1293,6 +1398,13 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const modeRequest = SplitOnce(request.second, kFieldSeparator);
             std::pair<std::string, std::string> const botRequest = SplitOnce(modeRequest.second, kFieldSeparator);
             SendQuestPackets(player, replyType, modeRequest.first, botRequest.first, botRequest.second);
+            return true;
+        }
+
+        if (requestType == "GLYPHS")
+        {
+            std::pair<std::string, std::string> const glyphRequest = SplitOnce(request.second, kFieldSeparator);
+            SendGlyphPackets(player, replyType, glyphRequest.first, glyphRequest.second);
             return true;
         }
 
