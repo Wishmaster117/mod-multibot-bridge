@@ -2,22 +2,28 @@
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
-#include "Player.h"
-#include "PlayerbotMgr.h"
-#include "PlayerbotAI.h"
 #include "ChatHelper.h"
+#include "Item.h"
+#include "ItemPackets.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "PlayerbotAI.h"
+#include "PlayerbotMgr.h"
+#include "Playerbots.h"
+#include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SpellMgr.h"
-#include "ScriptedGossip.h"
 #include "WorldPacket.h"
 
 #include <algorithm>
 #include <array>
-#include <map>
 #include <cctype>
-#include <sstream>
+#include <cstdlib>
+#include <map>
 #include <set>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -34,6 +40,8 @@ bool BridgeConsoleLogsEnabled()
 
 Player* FindBotByName(Player* player, std::string const& botName);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
+void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 uint32 GetPct(uint32 current, uint32 max);
 
 std::string Trim(std::string const& value)
@@ -98,6 +106,27 @@ std::string UrlEncodeField(std::string const& value)
     }
 
     return out.str();
+}
+
+std::string UrlDecodeField(std::string const& value)
+{
+    std::string out;
+    out.reserve(value.size());
+
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        if (value[i] == '%' && i + 2 < value.size() && std::isxdigit(static_cast<unsigned char>(value[i + 1])) && std::isxdigit(static_cast<unsigned char>(value[i + 2])))
+        {
+            std::string const hex = value.substr(i + 1, 2);
+            out.push_back(static_cast<char>(std::strtoul(hex.c_str(), nullptr, 16)));
+            i += 2;
+            continue;
+        }
+
+        out.push_back(value[i]);
+    }
+
+    return out;
 }
 
 struct InventorySummaryData
@@ -1085,6 +1114,462 @@ void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string con
     SendAddonPacket(requester, replyType, "SB_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
 }
 
+struct OutfitSetSnapshot
+{
+    std::string name;
+    std::vector<std::string> items;
+};
+
+std::string BuildOutfitRawLine(OutfitSetSnapshot const& outfit)
+{
+    std::ostringstream out;
+    out << outfit.name << ":";
+
+    for (std::string const& item : outfit.items)
+    {
+        if (!item.empty())
+            out << ' ' << item;
+    }
+
+    return out.str();
+}
+
+void AppendOutfitItemLink(OutfitSetSnapshot& outfit, uint32 itemEntry)
+{
+    if (!itemEntry)
+        return;
+
+    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemEntry);
+    if (!proto)
+        return;
+
+    outfit.items.push_back(ChatHelper::FormatItem(proto, 1));
+}
+
+std::vector<uint32> ParseOutfitItemEntries(std::string const& value)
+{
+    std::vector<uint32> entries;
+    std::stringstream in(value);
+    std::string item;
+
+    while (std::getline(in, item, ','))
+    {
+        item = Trim(item);
+        if (item.empty())
+            continue;
+
+        uint32 const itemEntry = static_cast<uint32>(std::strtoul(item.c_str(), nullptr, 10));
+        if (itemEntry)
+            entries.push_back(itemEntry);
+    }
+
+    return entries;
+}
+
+std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
+{
+    std::vector<OutfitSetSnapshot> outfits;
+    if (!bot)
+        return outfits;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return outfits;
+
+    auto* context = botAI->GetAiObjectContext();
+    if (!context)
+        return outfits;
+
+    std::vector<std::string>& savedOutfits = AI_VALUE(std::vector<std::string>&, "outfit list");
+
+    for (std::string const& savedOutfit : savedOutfits)
+    {
+        std::string const trimmed = Trim(savedOutfit);
+        if (trimmed.empty())
+            continue;
+
+        size_t const separator = trimmed.find('=');
+        if (separator == std::string::npos)
+            continue;
+
+        OutfitSetSnapshot outfit;
+        outfit.name = Trim(trimmed.substr(0, separator));
+        if (outfit.name.empty())
+            outfit.name = "Outfit";
+
+        std::vector<uint32> const entries = ParseOutfitItemEntries(trimmed.substr(separator + 1));
+        for (uint32 const itemEntry : entries)
+            AppendOutfitItemLink(outfit, itemEntry);
+
+        outfits.push_back(outfit);
+    }
+
+    return outfits;
+}
+
+void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Trim(requestToken);
+
+    SendAddonPacket(requester, replyType, "OUTFITS_BEGIN", headerPayload);
+
+    if (bot)
+    {
+        std::vector<OutfitSetSnapshot> const outfits = BuildOutfitSnapshots(bot);
+        for (OutfitSetSnapshot const& outfit : outfits)
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName())
+                << kFieldSeparator << Trim(requestToken)
+                << kFieldSeparator << UrlEncodeField(BuildOutfitRawLine(outfit));
+
+            SendAddonPacket(requester, replyType, "OUTFITS_ITEM", payload.str());
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "OUTFITS_END", headerPayload);
+}
+
+struct OutfitCommandParts
+{
+    std::string name;
+    std::string action;
+};
+
+OutfitCommandParts ParseOutfitCommandSuffix(std::string const& suffix)
+{
+    OutfitCommandParts parts;
+
+    std::string const cleaned = Trim(suffix);
+    std::size_t const lastSpace = cleaned.find_last_of(' ');
+    if (lastSpace == std::string::npos || lastSpace == 0 || lastSpace + 1 >= cleaned.size())
+        return parts;
+
+    parts.name = Trim(cleaned.substr(0, lastSpace));
+    parts.action = ToUpper(Trim(cleaned.substr(lastSpace + 1)));
+    return parts;
+}
+
+bool IsAllowedOutfitCommandSuffix(std::string const& suffix)
+{
+    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
+    if (parts.name.empty())
+        return false;
+
+    return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
+}
+
+bool IsUpdateOutfitCommandSuffix(std::string const& suffix)
+{
+    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
+    return parts.action == "UPDATE";
+}
+
+bool IsDirectBridgeOutfitCommandSuffix(std::string const& suffix)
+{
+    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
+    return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
+}
+
+std::string SanitizeOutfitCommandSuffix(std::string suffix)
+{
+    suffix.erase(std::remove(suffix.begin(), suffix.end(), '\r'), suffix.end());
+    suffix.erase(std::remove(suffix.begin(), suffix.end(), '\n'), suffix.end());
+    return Trim(suffix);
+}
+
+std::vector<uint32> CollectCurrentEquippedOutfitEntries(Player* bot)
+{
+    std::set<uint32> uniqueEntries;
+
+    if (bot)
+    {
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item const* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (item && item->GetEntry())
+                uniqueEntries.insert(item->GetEntry());
+        }
+    }
+
+    return std::vector<uint32>(uniqueEntries.begin(), uniqueEntries.end());
+}
+
+bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::vector<uint32> const& entries)
+{
+    if (!botAI)
+        return false;
+
+    auto* context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    std::string const name = Trim(outfitName);
+    if (name.empty())
+        return false;
+
+    std::vector<std::string>& savedOutfits = AI_VALUE(std::vector<std::string>&, "outfit list");
+
+    for (std::vector<std::string>::iterator it = savedOutfits.begin(); it != savedOutfits.end(); ++it)
+    {
+        std::string const existing = Trim(*it);
+        std::size_t const separator = existing.find('=');
+        std::string const existingName = Trim(separator == std::string::npos ? existing : existing.substr(0, separator));
+        if (existingName == name)
+        {
+            savedOutfits.erase(it);
+            break;
+        }
+    }
+
+    if (entries.empty())
+        return true;
+
+    std::ostringstream out;
+    out << name << '=';
+    for (std::size_t index = 0; index < entries.size(); ++index)
+    {
+        if (index)
+            out << ',';
+        out << entries[index];
+    }
+
+    savedOutfits.push_back(out.str());
+    return true;
+}
+
+bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
+{
+    if (!bot)
+        return false;
+
+    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
+    if (parts.name.empty())
+        return false;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return false;
+
+    if (parts.action == "EQUIP" || parts.action == "REPLACE")
+    {
+        std::vector<uint32> entries;
+
+        {
+            auto* context = botAI->GetAiObjectContext();
+            if (!context)
+                return false;
+
+            std::string const outfitName = Trim(parts.name);
+            if (outfitName.empty())
+                return false;
+
+            std::vector<std::string>& savedOutfits = AI_VALUE(std::vector<std::string>&, "outfit list");
+            for (std::string const& savedOutfit : savedOutfits)
+            {
+                std::string const existing = Trim(savedOutfit);
+                std::size_t const separator = existing.find('=');
+                if (separator == std::string::npos)
+                    continue;
+
+                std::string const existingName = Trim(existing.substr(0, separator));
+                if (existingName != outfitName)
+                    continue;
+
+                entries = ParseOutfitItemEntries(existing.substr(separator + 1));
+                break;
+            }
+        }
+
+        if (entries.empty())
+            return false;
+
+        auto findItemByEntry = [bot](uint32 itemEntry) -> Item*
+        {
+            if (!bot || !itemEntry)
+                return nullptr;
+
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (item && item->GetEntry() == itemEntry)
+                    return item;
+            }
+
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            {
+                Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (item && item->GetEntry() == itemEntry)
+                    return item;
+            }
+
+            for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            {
+                Bag* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+                if (!pBag)
+                    continue;
+
+                for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                {
+                    Item* const item = bot->GetItemByPos(bag, slot);
+                    if (item && item->GetEntry() == itemEntry)
+                        return item;
+                }
+            }
+
+            return nullptr;
+        };
+
+        auto equipItemByEntry = [bot, botAI, &findItemByEntry](uint32 itemEntry) -> bool
+        {
+            if (!bot || !bot->GetSession() || !botAI || !itemEntry)
+                return false;
+
+            Item* const item = findItemByEntry(itemEntry);
+            if (!item)
+                return false;
+
+            ItemTemplate const* const itemProto = item->GetTemplate();
+            if (!itemProto)
+                return false;
+
+            if (itemProto->InventoryType == INVTYPE_AMMO)
+            {
+                bot->SetAmmo(itemProto->ItemId);
+                return true;
+            }
+
+            if (itemProto->Class == ITEM_CLASS_CONTAINER)
+                return false;
+
+            uint8 dstSlot = NULL_SLOT;
+            if (itemProto->InventoryType == INVTYPE_RANGED || itemProto->InventoryType == INVTYPE_THROWN || itemProto->InventoryType == INVTYPE_RANGEDRIGHT)
+                dstSlot = EQUIPMENT_SLOT_RANGED;
+            else
+                dstSlot = botAI->FindEquipSlot(itemProto, NULL_SLOT, true);
+
+            if (dstSlot == NULL_SLOT)
+                return false;
+
+            if ((dstSlot == EQUIPMENT_SLOT_FINGER1 || dstSlot == EQUIPMENT_SLOT_TRINKET1)
+                && bot->GetItemByPos(INVENTORY_SLOT_BAG_0, dstSlot)
+                && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, dstSlot + 1))
+            {
+                ++dstSlot;
+            }
+
+            if (item->GetBagSlot() == INVENTORY_SLOT_BAG_0 && item->GetSlot() == dstSlot)
+                return true;
+
+            WorldPacket packet(CMSG_AUTOEQUIP_ITEM_SLOT, 2);
+            ObjectGuid itemGuid = item->GetGUID();
+            packet << itemGuid << dstSlot;
+
+            WorldPackets::Item::AutoEquipItemSlot nicePacket(std::move(packet));
+            nicePacket.Read();
+            bot->GetSession()->HandleAutoEquipItemSlotOpcode(nicePacket);
+            return true;
+        };
+
+        if (parts.action == "REPLACE")
+        {
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item const* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (!item)
+                    continue;
+
+                uint8 const bagIndex = item->GetBagSlot();
+                uint8 const dstBag = NULL_BAG;
+
+                WorldPacket packet(CMSG_AUTOSTORE_BAG_ITEM, 3);
+                packet << bagIndex << slot << dstBag;
+
+                WorldPackets::Item::AutoStoreBagItem nicePacket(std::move(packet));
+                nicePacket.Read();
+                bot->GetSession()->HandleAutoStoreBagItemOpcode(nicePacket);
+            }
+        }
+
+        bool equippedAny = false;
+        for (uint32 const itemEntry : entries)
+        {
+            if (equipItemByEntry(itemEntry))
+                equippedAny = true;
+        }
+
+        if (!equippedAny)
+            return false;
+
+        std::ostringstream out;
+        if (parts.action == "REPLACE")
+            out << "Replacing current equip with outfit " << parts.name;
+        else
+            out << "Equipping outfit " << parts.name;
+
+        botAI->TellMaster(out.str());
+        return true;
+    }
+
+    if (parts.action == "UPDATE")
+    {
+        std::vector<uint32> const entries = CollectCurrentEquippedOutfitEntries(bot);
+        if (entries.empty())
+            return false;
+
+        return SaveOutfitEntries(botAI, parts.name, entries);
+    }
+
+    if (parts.action == "RESET")
+        return SaveOutfitEntries(botAI, parts.name, std::vector<uint32>());
+
+    return false;
+}
+
+bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& command)
+{
+    if (!requester || !bot || command.empty())
+        return false;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return false;
+
+    botAI->HandleCommand(CHAT_MSG_WHISPER, command, requester);
+    return true;
+}
+
+void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    std::string const suffix = SanitizeOutfitCommandSuffix(UrlDecodeField(encodedSuffix));
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    bool ok = false;
+    if (bot && IsAllowedOutfitCommandSuffix(suffix))
+    {
+        if (IsDirectBridgeOutfitCommandSuffix(suffix))
+            ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
+        else
+            ok = ExecuteSilentBotCommand(requester, bot, "outfit " + suffix);
+
+        if (ok && IsUpdateOutfitCommandSuffix(suffix) && Trim(persistToken) == "1")
+            ExecuteSilentBotCommand(requester, bot, "nc +chat");
+    }
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (ok ? "OK" : "ERR");
+
+    SendAddonPacket(requester, replyType, "OUTFITS_CMD", payload.str());
+}
+
 ChatMsg NormalizeReplyChatType(uint32 type)
 {
     switch (type)
@@ -1441,6 +1926,30 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             std::pair<std::string, std::string> const spellbookRequest = SplitOnce(request.second, kFieldSeparator);
             SendSpellbookSnapshot(player, replyType, spellbookRequest.first, Trim(spellbookRequest.second));
+            return true;
+        }
+
+        if (requestType == "OUTFITS")
+        {
+            std::pair<std::string, std::string> const outfitRequest = SplitOnce(request.second, kFieldSeparator);
+            SendOutfitPackets(player, replyType, outfitRequest.first, Trim(outfitRequest.second));
+            return true;
+        }
+
+        return false;
+    }
+
+    if (normalized == "RUN")
+    {
+        std::pair<std::string, std::string> const request = SplitOnce(payload, kFieldSeparator);
+        std::string const requestType = ToUpper(Trim(request.first));
+
+        if (requestType == "OUTFIT")
+        {
+            std::pair<std::string, std::string> const botRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
+            RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
             return true;
         }
 
