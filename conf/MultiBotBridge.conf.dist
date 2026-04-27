@@ -1,6 +1,0 @@
-# MultiBotBridge module configuration
-#
-# Enable bridge console logs (RX / TX / startup).
-# 1 = enabled
-# 0 = disabled
-MultiBotBridge.EnableConsoleLogs = 1
