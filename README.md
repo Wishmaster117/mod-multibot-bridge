@@ -25,14 +25,8 @@ allowing MultiBot to refresh bot data without relying on automatic legacy chat p
 
 <br>
 
-<a href="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/linux-build.yml">
-  <img alt="linux-build" src="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/linux-build.yml/badge.svg?branch=main" />
-</a>
-<a href="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/windows-build.yml">
-  <img alt="windows-build" src="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/windows-build.yml/badge.svg?branch=main" />
-</a>
-<a href="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/macos-build.yml">
-  <img alt="macos-build" src="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/macos-build.yml/badge.svg?branch=main" />
+<a href="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/compile-playerbot.yml">
+  <img alt="compile-playerbot" src="https://github.com/Wishmaster117/mod-multibot-bridge/actions/workflows/compile-playerbot.yml/badge.svg?branch=main&event=workflow_dispatch" />
 </a>
 
 <br><br>
