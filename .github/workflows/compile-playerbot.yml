@@ -74,19 +74,17 @@ jobs:
           cmake -S azerothcore -B build-linux \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc \
-            -DCMAKE_CXX_COMPILER=g++
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DTOOLS=0
 
-      - name: Build
+      - name: Build worldserver
         run: |
-          cmake --build build-linux --config Release --parallel 2
+          cmake --build build-linux --target worldserver --parallel 2
 
   windows:
     name: Windows / AzerothCore Playerbot
-    runs-on: windows-latest
+    runs-on: windows-2022
     if: ${{ inputs.target_os == 'windows' || inputs.target_os == 'all' }}
-
-    env:
-      BOOST_ROOT: 'C:\local\boost_1_82_0'
 
     steps:
       - name: Checkout AzerothCore Playerbot
@@ -109,35 +107,110 @@ jobs:
         with:
           path: azerothcore/modules/mod-multibot-bridge
 
-      - name: Verify Playerbots dependency
-        shell: bash
-        run: |
-          test -d azerothcore/modules/mod-playerbots
-          find azerothcore/modules/mod-playerbots -name "ChatHelper.h" -print -quit | grep -q .
-
       - name: Move repo to short path
         shell: bash
         run: |
           mkdir -p /c/ac
           cp -a azerothcore/. /c/ac/
 
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.13
-
-      - name: Configure Windows requirements
-        shell: bash
-        env:
-          CONTINUOUS_INTEGRATION: true
+      - name: Verify Playerbots dependency
+        shell: pwsh
         run: |
-          cd /c/ac
-          ./acore.sh install-deps
+          if (-not (Test-Path "C:\ac\modules\mod-playerbots")) {
+            throw "mod-playerbots was not checked out."
+          }
 
-      - name: Build
-        shell: bash
+          $chatHelper = Get-ChildItem -Path "C:\ac\modules\mod-playerbots" -Recurse -Filter "ChatHelper.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $chatHelper) {
+            throw "ChatHelper.h was not found in mod-playerbots."
+          }
+
+          Write-Host "Found ChatHelper.h at: $($chatHelper.FullName)"
+
+      - name: Install Windows requirements
+        shell: pwsh
         run: |
-          cd /c/ac
-          export CTOOLS_BUILD=all
-          ./acore.sh compiler build
+          choco install boost-msvc-14.3 -y --no-progress
+
+          $boostRoot = Get-ChildItem -Path "C:\local" -Directory -Filter "boost_*" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          if (-not $boostRoot) {
+            throw "Boost was not found under C:\local."
+          }
+
+          "BOOST_ROOT=$($boostRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "BOOST_ROOT=$($boostRoot.FullName)"
+
+      - name: Locate or download MySQL dev files
+        shell: pwsh
+        run: |
+          function Find-MySqlDev {
+            $roots = @(
+              "C:\Program Files\MySQL",
+              "C:\tools\mysql",
+              "C:\mysql"
+            ) | Where-Object { Test-Path $_ }
+
+            foreach ($root in $roots) {
+              $header = Get-ChildItem -Path $root -Recurse -Filter "mysql.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+              $library = Get-ChildItem -Path $root -Recurse -Filter "libmysql.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+              if ($header -and $library) {
+                return [PSCustomObject]@{
+                  Include = $header.DirectoryName
+                  Library = $library.FullName
+                }
+              }
+            }
+
+            return $null
+          }
+
+          $mysql = Find-MySqlDev
+
+          if (-not $mysql) {
+            $zipPath = "$env:RUNNER_TEMP\mysql-8.0.46-winx64.zip"
+            $extractPath = "C:\mysql"
+
+            Write-Host "MySQL dev files not found. Downloading MySQL 8.0.46 ZIP archive..."
+            Invoke-WebRequest `
+              -Uri "https://cdn.mysql.com/Downloads/MySQL-8.0/mysql-8.0.46-winx64.zip" `
+              -OutFile $zipPath
+
+            New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+            $mysql = Find-MySqlDev
+          }
+
+          if (-not $mysql) {
+            throw "Unable to locate MySQL mysql.h and libmysql.lib."
+          }
+
+          "MYSQL_INCLUDE_DIR=$($mysql.Include)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "MYSQL_LIBRARY=$($mysql.Library)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "MYSQL_INCLUDE_DIR=$($mysql.Include)"
+          Write-Host "MYSQL_LIBRARY=$($mysql.Library)"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S C:\ac -B C:\ac-build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DTOOLS=0 `
+            "-DBOOST_ROOT=$env:BOOST_ROOT" `
+            "-DMYSQL_INCLUDE_DIR=$env:MYSQL_INCLUDE_DIR" `
+            "-DMYSQL_LIBRARY=$env:MYSQL_LIBRARY"
+
+      - name: Build worldserver
+        shell: pwsh
+        run: |
+          cmake --build C:\ac-build --config Release --target worldserver --parallel 2
 
   macos:
     name: macOS / AzerothCore Playerbot
