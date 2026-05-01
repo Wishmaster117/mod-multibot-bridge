@@ -14,6 +14,7 @@
 #include "AiObjectContext.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
+#include "SharedDefines.h"
 #include "SpellMgr.h"
 #include "WorldPacket.h"
 
@@ -171,6 +172,29 @@ struct BotDetailData
     std::array<uint32, 3> talentTabs = {0, 0, 0};
     uint32 itemLevelScore = 0;
 };
+
+struct ProfessionSkillDefinition
+{
+    uint32 skillId = 0;
+    char const* key = "";
+};
+
+std::array<ProfessionSkillDefinition, 14> const kProfessionSkillDefinitions = {{
+    { SKILL_ALCHEMY, "alchemy" },
+    { SKILL_BLACKSMITHING, "blacksmithing" },
+    { SKILL_ENCHANTING, "enchanting" },
+    { SKILL_ENGINEERING, "engineering" },
+    { SKILL_HERBALISM, "herbalism" },
+    { SKILL_INSCRIPTION, "inscription" },
+    { SKILL_JEWELCRAFTING, "jewelcrafting" },
+    { SKILL_LEATHERWORKING, "leatherworking" },
+    { SKILL_MINING, "mining" },
+    { SKILL_SKINNING, "skinning" },
+    { SKILL_TAILORING, "tailoring" },
+    { SKILL_COOKING, "cooking" },
+    { SKILL_FIRST_AID, "firstaid" },
+    { SKILL_FISHING, "fishing" },
+}};
 
 struct PvpStatsData
 {
@@ -377,6 +401,34 @@ std::string BuildBotDetailPayload(Player* bot)
         << detail.level << kFieldSeparator << detail.talentTabs[0] << kFieldSeparator << detail.talentTabs[1]
         << kFieldSeparator << detail.talentTabs[2] << kFieldSeparator << detail.itemLevelScore;
     return out.str();
+}
+
+std::string BuildBotProfessionPayload(Player* bot)
+{
+    if (!bot)
+        return "";
+
+    std::ostringstream out;
+    out << UrlEncodeField(bot->GetName()) << kFieldSeparator;
+
+    bool first = true;
+    for (ProfessionSkillDefinition const& profession : kProfessionSkillDefinitions)
+    {
+        uint32 const value = bot->GetSkillValue(profession.skillId);
+        uint32 const maxValue = bot->GetMaxSkillValue(profession.skillId);
+        if (!value && !maxValue)
+            continue;
+
+        if (!first)
+            out << ';';
+        first = false;
+
+        std::ostringstream token;
+        token << profession.key << ':' << value << '/' << maxValue;
+        out << UrlEncodeField(token.str());
+    }
+
+    return first ? "" : out.str();
 }
 
 uint8 ArenaTeamTypeToPayloadIndex(uint8 type)
@@ -2073,6 +2125,11 @@ void SendDetailPackets(Player* player, ChatMsg replyType)
             continue;
 
         SendAddonPacket(player, replyType, "DETAIL", payload);
+
+        std::string const professionPayload = BuildBotProfessionPayload(bot);
+        if (!professionPayload.empty())
+            SendAddonPacket(player, replyType, "PROFESSION", professionPayload);
+
         sent = true;
     }
 
@@ -2087,6 +2144,40 @@ std::string BuildDetailPayload(Player* player, std::string const& botName)
         return "";
 
     return BuildBotDetailPayload(bot);
+}
+
+std::string BuildProfessionPayload(Player* player, std::string const& botName)
+{
+    Player* const bot = FindBotByName(player, botName);
+    if (!bot)
+        return "";
+
+    return BuildBotProfessionPayload(bot);
+}
+
+void SendProfessionPackets(Player* player, ChatMsg replyType)
+{
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
+    if (!mgr)
+    {
+        SendAddonPacket(player, replyType, "PROFESSIONS", "");
+        return;
+    }
+
+    bool sent = false;
+    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    {
+        Player* const bot = it->second;
+        std::string const payload = BuildBotProfessionPayload(bot);
+        if (payload.empty())
+            continue;
+
+        SendAddonPacket(player, replyType, "PROFESSION", payload);
+        sent = true;
+    }
+
+    if (!sent)
+        SendAddonPacket(player, replyType, "PROFESSIONS", "");
 }
 
 std::string BuildPvpStatsPayload(Player* player, std::string const& botName)
@@ -2225,12 +2316,29 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         if (requestType == "DETAIL")
         {
             SendAddonPacket(player, replyType, "DETAIL", BuildDetailPayload(player, request.second));
+
+            std::string const professionPayload = BuildProfessionPayload(player, request.second);
+            if (!professionPayload.empty())
+                SendAddonPacket(player, replyType, "PROFESSION", professionPayload);
+
             return true;
         }
 
         if (requestType == "DETAILS")
         {
             SendDetailPackets(player, replyType);
+            return true;
+        }
+
+        if (requestType == "PROFESSION")
+        {
+            SendAddonPacket(player, replyType, "PROFESSION", BuildProfessionPayload(player, request.second));
+            return true;
+        }
+
+        if (requestType == "PROFESSIONS")
+        {
+            SendProfessionPackets(player, replyType);
             return true;
         }
 
