@@ -12,6 +12,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "Playerbots.h"
+#include "RandomPlayerbotMgr.h"
 #include "AiObjectContext.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
@@ -45,6 +46,7 @@ bool BridgeConsoleLogsEnabled()
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
+std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
@@ -887,18 +889,8 @@ void SendQuestPackets(Player* player, ChatMsg replyType, std::string const& mode
         return;
     }
 
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (mgr)
-    {
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-        {
-            Player* const bot = it->second;
-            if (!bot)
-                continue;
-
-            SendQuestPacketsForBot(player, replyType, bot, mode, token);
-        }
-    }
+    for (Player* const bot : GetBridgeVisibleBots(player))
+        SendQuestPacketsForBot(player, replyType, bot, mode, token);
 
     SendAddonPacket(player, replyType, "QUESTS_DONE", token + std::string(1, kFieldSeparator) + mode);
 }
@@ -969,10 +961,8 @@ void SendGameObjectPackets(Player* player, ChatMsg replyType, std::string const&
         return;
     }
 
-    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-            if (Player* const bot = it->second)
-                SendGameObjectPacketsForBot(player, replyType, bot, token);
+    for (Player* const bot : GetBridgeVisibleBots(player))
+        SendGameObjectPacketsForBot(player, replyType, bot, token);
 
     SendAddonPacket(player, replyType, "GAMEOBJECTS_DONE", token);
 }
@@ -1951,12 +1941,10 @@ void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scop
     std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-    if (mgr && IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
+    if (IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
     {
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        for (Player* const bot : GetBridgeVisibleBots(requester))
         {
-            Player* const bot = it->second;
             if (!BotMatchesRTIScope(requester, bot, scope, target))
                 continue;
 
@@ -1984,12 +1972,10 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
     std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-    if (mgr && IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    if (IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        for (Player* const bot : GetBridgeVisibleBots(requester))
         {
-            Player* const bot = it->second;
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -2017,12 +2003,10 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
     std::string const command = NormalizePositionCommand(rawCommand);
     uint32 executed = 0;
 
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-    if (mgr && IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    if (IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        for (Player* const bot : GetBridgeVisibleBots(requester))
         {
-            Player* const bot = it->second;
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -2050,12 +2034,10 @@ void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& sco
     std::string const command = NormalizeLootCommand(rawCommand);
     uint32 executed = 0;
 
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-    if (mgr && IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    if (IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        for (Player* const bot : GetBridgeVisibleBots(requester))
         {
-            Player* const bot = it->second;
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -2115,22 +2097,79 @@ uint32 GetPct(uint32 current, uint32 max)
     return static_cast<uint32>((current * 100u) / max);
 }
 
+bool IsBotInRequesterGroup(Player* requester, Player* bot)
+{
+    if (!requester || !bot)
+        return false;
+
+    Group* const group = requester->GetGroup();
+    return group && bot->GetGroup() == group;
+}
+
+bool IsBotMasteredByRequester(Player* requester, Player* bot)
+{
+    if (!requester || !bot)
+        return false;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    return botAI && botAI->GetMaster() == requester;
+}
+
+bool CanExposeRandomHolderBot(Player* requester, Player* bot)
+{
+    if (!requester || !bot)
+        return false;
+
+    if (!sPlayerbotsMgr.GetPlayerbotAI(bot))
+        return false;
+
+    if (!sRandomPlayerbotMgr.IsRandomBot(bot) && !sRandomPlayerbotMgr.IsAddclassBot(bot))
+        return false;
+
+    return IsBotMasteredByRequester(requester, bot) || IsBotInRequesterGroup(requester, bot);
+}
+
+void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
+{
+    if (!bot)
+        return;
+
+    if (!seen.insert(bot->GetGUID()).second)
+        return;
+
+    bots.push_back(bot);
+}
+
+std::vector<Player*> GetBridgeVisibleBots(Player* player)
+{
+    std::vector<Player*> bots;
+    std::set<ObjectGuid> seen;
+
+    if (!player)
+        return bots;
+
+    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+            AppendBridgeVisibleBot(it->second, bots, seen);
+
+    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+    {
+        Player* const bot = it->second;
+        if (CanExposeRandomHolderBot(player, bot))
+            AppendBridgeVisibleBot(bot, bots, seen);
+    }
+
+    return bots;
+}
+
 Player* FindBotByName(Player* player, std::string const& botName)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-        return nullptr;
-
     std::string const wantedName = Trim(botName);
     if (wantedName.empty())
         return nullptr;
 
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         if (bot->GetName() == wantedName)
             return bot;
     }
@@ -2155,19 +2194,11 @@ std::string JoinStrategies(std::vector<std::string> const& strategies)
 
 std::string BuildRosterPayload(Player* player)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-        return "";
-
     std::ostringstream out;
     bool first = true;
 
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         if (!first)
             out << ';';
         first = false;
@@ -2182,21 +2213,10 @@ std::string BuildRosterPayload(Player* player)
 
 void SendDetailPackets(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-    {
-        SendAddonPacket(player, replyType, "DETAILS", "");
-        return;
-    }
-
     bool sent = false;
 
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         std::string const payload = BuildBotDetailPayload(bot);
         if (payload.empty())
             continue;
@@ -2234,17 +2254,9 @@ std::string BuildProfessionPayload(Player* player, std::string const& botName)
 
 void SendProfessionPackets(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-    {
-        SendAddonPacket(player, replyType, "PROFESSIONS", "");
-        return;
-    }
-
     bool sent = false;
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
         std::string const payload = BuildBotProfessionPayload(bot);
         if (payload.empty())
             continue;
@@ -2268,16 +2280,8 @@ std::string BuildPvpStatsPayload(Player* player, std::string const& botName)
 
 void SendPvpStatsPackets(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-        return;
-
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         std::string const payload = BuildPvpStatsPayload(bot);
         if (!payload.empty())
             SendAddonPacket(player, replyType, "PVP_STATS", payload);
@@ -2302,20 +2306,9 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
 
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-    {
-        SendAddonPacket(player, replyType, "STATES", "");
-        return;
-    }    
-
     bool sent = false;
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
         std::string combatStrategies;
         std::string nonCombatStrategies;
@@ -2347,16 +2340,8 @@ std::string BuildStatsPayload(Player* player, std::string const& botName)
 
 void SendStatsPackets(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player);
-    if (!mgr)
-        return;
-
-    for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+    for (Player* const bot : GetBridgeVisibleBots(player))
     {
-        Player* const bot = it->second;
-        if (!bot)
-            continue;
-
         std::string const payload = BuildStatsPayload(bot);
         if (!payload.empty())
             SendAddonPacket(player, replyType, "STATS", payload);
