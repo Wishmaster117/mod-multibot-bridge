@@ -167,6 +167,24 @@ struct SpellbookEntryData
     std::string spellName;
 };
 
+struct BotSkillEntryData
+{
+    uint32 skillId = 0;
+    std::string category;
+    std::string key;
+    std::string name;
+    uint32 value = 0;
+    uint32 maxValue = 0;
+};
+
+struct SkillDefinition
+{
+    uint32 skillId = 0;
+    char const* key = "";
+    char const* name = "";
+    char const* category = "";
+};
+
 struct BotDetailData
 {
     std::string name;
@@ -199,6 +217,83 @@ std::array<ProfessionSkillDefinition, 14> const kProfessionSkillDefinitions = {{
     { SKILL_COOKING, "cooking" },
     { SKILL_FIRST_AID, "firstaid" },
     { SKILL_FISHING, "fishing" },
+}};
+
+std::array<SkillDefinition, 11> const kPrimaryProfessionSkillDefinitions = {{
+    { SKILL_ALCHEMY, "alchemy", "Alchemy", "profession" },
+    { SKILL_BLACKSMITHING, "blacksmithing", "Blacksmithing", "profession" },
+    { SKILL_ENCHANTING, "enchanting", "Enchanting", "profession" },
+    { SKILL_ENGINEERING, "engineering", "Engineering", "profession" },
+    { SKILL_HERBALISM, "herbalism", "Herbalism", "profession" },
+    { SKILL_INSCRIPTION, "inscription", "Inscription", "profession" },
+    { SKILL_JEWELCRAFTING, "jewelcrafting", "Jewelcrafting", "profession" },
+    { SKILL_LEATHERWORKING, "leatherworking", "Leatherworking", "profession" },
+    { SKILL_MINING, "mining", "Mining", "profession" },
+    { SKILL_SKINNING, "skinning", "Skinning", "profession" },
+    { SKILL_TAILORING, "tailoring", "Tailoring", "profession" },
+}};
+
+std::array<SkillDefinition, 3> const kSecondarySkillDefinitions = {{
+    { SKILL_COOKING, "cooking", "Cooking", "secondary" },
+    { SKILL_FIRST_AID, "firstaid", "First Aid", "secondary" },
+    { SKILL_FISHING, "fishing", "Fishing", "secondary" },
+}};
+
+std::array<SkillDefinition, 28> const kClassSkillDefinitions = {{
+    { 6, "frost", "Frost", "class" },
+    { 8, "fire", "Fire", "class" },
+    { 26, "arms", "Arms", "class" },
+    { 38, "combat", "Combat", "class" },
+    { 39, "subtlety", "Subtlety", "class" },
+    { 50, "beastmastery", "Beast Mastery", "class" },
+    { 51, "survival", "Survival", "class" },
+    { 56, "holy", "Holy", "class" },
+    { 78, "shadow", "Shadow Magic", "class" },
+    { 134, "feralcombat", "Feral Combat", "class" },
+    { 163, "marksmanship", "Marksmanship", "class" },
+    { 184, "retribution", "Retribution", "class" },
+    { 237, "arcane", "Arcane", "class" },
+    { 253, "assassination", "Assassination", "class" },
+    { 256, "fury", "Fury", "class" },
+    { 257, "protection", "Protection", "class" },
+    { 267, "paladinprotection", "Protection", "class" },
+    { 354, "demonology", "Demonology", "class" },
+    { 355, "affliction", "Affliction", "class" },
+    { 373, "enhancement", "Enhancement", "class" },
+    { 374, "restoration", "Restoration", "class" },
+    { 375, "elemental", "Elemental Combat", "class" },
+    { 573, "druidrestoration", "Restoration", "class" },
+    { 574, "balance", "Balance", "class" },
+    { 593, "destruction", "Destruction", "class" },
+    { 613, "discipline", "Discipline", "class" },
+    { 770, "blood", "Blood", "class" },
+    { 771, "deathknightfrost", "Frost", "class" },
+}};
+
+std::array<SkillDefinition, 23> const kWeaponSkillDefinitions = {{
+    { 43, "swords", "Swords", "weapon" },
+    { 44, "axes", "Axes", "weapon" },
+    { 45, "bows", "Bows", "weapon" },
+    { 46, "guns", "Guns", "weapon" },
+    { 54, "maces", "Maces", "weapon" },
+    { 55, "twohandedswords", "Two-Handed Swords", "weapon" },
+    { 95, "defense", "Defense", "weapon" },
+    { 118, "dualwield", "Dual Wield", "weapon" },
+    { 136, "staves", "Staves", "weapon" },
+    { 160, "twohandedmaces", "Two-Handed Maces", "weapon" },
+    { 162, "unarmed", "Unarmed", "weapon" },
+    { 172, "twohandedaxes", "Two-Handed Axes", "weapon" },
+    { 173, "daggers", "Daggers", "weapon" },
+    { 176, "thrown", "Thrown", "weapon" },
+    { 226, "crossbows", "Crossbows", "weapon" },
+    { 228, "wands", "Wands", "weapon" },
+    { 229, "polearms", "Polearms", "weapon" },
+    { 473, "fistweapons", "Fist Weapons", "weapon" },
+    { 293, "platemail", "Plate Mail", "armor" },
+    { 413, "mail", "Mail", "armor" },
+    { 414, "leather", "Leather", "armor" },
+    { 415, "cloth", "Cloth", "armor" },
+    { 433, "shield", "Shield", "armor" },
 }};
 
 struct PvpStatsData
@@ -405,6 +500,92 @@ std::string BuildBotDetailPayload(Player* bot)
         << UrlEncodeField(detail.gender) << kFieldSeparator << UrlEncodeField(detail.className) << kFieldSeparator
         << detail.level << kFieldSeparator << detail.talentTabs[0] << kFieldSeparator << detail.talentTabs[1]
         << kFieldSeparator << detail.talentTabs[2] << kFieldSeparator << detail.itemLevelScore;
+    return out.str();
+}
+
+SkillLineAbilityEntry const* GetSkillLineAbilityForSpell(uint32 spellId)
+{
+    static bool initialized = false;
+    static std::map<uint32, SkillLineAbilityEntry const*> spellSkillLines;
+
+    if (!initialized)
+    {
+        initialized = true;
+        for (uint32 index = 0; index < sSkillLineAbilityStore.GetNumRows(); ++index)
+            if (SkillLineAbilityEntry const* const skillLine = sSkillLineAbilityStore.LookupEntry(index))
+                if (skillLine->Spell)
+                    spellSkillLines[skillLine->Spell] = skillLine;
+    }
+
+    auto const it = spellSkillLines.find(spellId);
+    return it != spellSkillLines.end() ? it->second : nullptr;
+}
+
+bool IsProfessionSkillLine(uint32 skillId)
+{
+    SkillLineEntry const* const skillLine = sSkillLineStore.LookupEntry(skillId);
+    return skillLine && skillLine->categoryId == SKILL_CATEGORY_PROFESSION;
+}
+
+bool IsProfessionSpell(uint32 spellId)
+{
+    SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
+    return skillLine && IsProfessionSkillLine(skillLine->SkillLine);
+}
+
+void AddSkillEntry(Player* bot, SkillDefinition const& definition, std::vector<BotSkillEntryData>& entries, std::set<uint32>& seen)
+{
+    if (!bot || !definition.skillId || !seen.insert(definition.skillId).second)
+        return;
+
+    uint32 const value = bot->GetSkillValue(definition.skillId);
+    uint32 const maxValue = bot->GetMaxSkillValue(definition.skillId);
+    if (!value && !maxValue)
+        return;
+
+    BotSkillEntryData entry;
+    entry.skillId = definition.skillId;
+    entry.category = definition.category;
+    entry.key = definition.key;
+    entry.name = definition.name;
+    entry.value = value;
+    entry.maxValue = maxValue;
+    entries.push_back(entry);
+}
+
+std::vector<BotSkillEntryData> BuildBotSkillEntries(Player* bot)
+{
+    std::vector<BotSkillEntryData> entries;
+    std::set<uint32> seen;
+    if (!bot)
+        return entries;
+
+    for (SkillDefinition const& definition : kClassSkillDefinitions)
+        AddSkillEntry(bot, definition, entries, seen);
+
+    for (SkillDefinition const& definition : kPrimaryProfessionSkillDefinitions)
+        AddSkillEntry(bot, definition, entries, seen);
+
+    for (SkillDefinition const& definition : kSecondarySkillDefinitions)
+        AddSkillEntry(bot, definition, entries, seen);
+
+    for (SkillDefinition const& definition : kWeaponSkillDefinitions)
+        AddSkillEntry(bot, definition, entries, seen);
+
+    return entries;
+}
+
+std::string BuildBotSkillEntryPayload(Player* bot, std::string const& token, BotSkillEntryData const& entry)
+{
+    std::ostringstream out;
+    out << UrlEncodeField(bot->GetName())
+        << kFieldSeparator << token
+        << kFieldSeparator << UrlEncodeField(entry.category)
+        << kFieldSeparator << entry.skillId
+        << kFieldSeparator << UrlEncodeField(entry.key)
+        << kFieldSeparator << UrlEncodeField(entry.name)
+        << kFieldSeparator << entry.value
+        << kFieldSeparator << entry.maxValue;
     return out.str();
 }
 
@@ -1001,6 +1182,9 @@ std::vector<SpellbookEntryData> BuildSpellbookEntries(Player* bot)
         if (!spellInfo || spellInfo->IsPassive() || !spellInfo->SpellName[0])
             continue;
 
+        if (IsProfessionSpell(it->first))
+            continue;
+
         std::string const spellName = spellInfo->SpellName[0];
         if (spellName.empty())
             continue;
@@ -1016,6 +1200,148 @@ std::vector<SpellbookEntryData> BuildSpellbookEntries(Player* bot)
     }
 
     std::sort(entries.begin(), entries.end(), CompareSpellbookEntries);
+    return entries;
+}
+
+struct ProfessionRecipeEntryData
+{
+    uint32 spellId = 0;
+    std::string spellName;
+    uint32 itemId = 0;
+    std::string difficulty;
+    uint32 craftable = 0;
+    std::string materials;
+};
+
+std::map<uint32, uint32> BuildBotInventoryItemCounts(Player* bot)
+{
+    std::map<uint32, uint32> counts;
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return counts;
+
+    std::vector<Item*> const items = botAI->GetInventoryItems();
+    for (Item* const item : items)
+    {
+        if (!item)
+            continue;
+
+        ItemTemplate const* const proto = item->GetTemplate();
+        if (!proto)
+            continue;
+
+        counts[proto->ItemId] += item->GetCount();
+    }
+
+    return counts;
+}
+
+std::string GetRecipeDifficulty(Player* bot, SkillLineAbilityEntry const* skillLine)
+{
+    if (!bot || !skillLine || !skillLine->SkillLine)
+        return "";
+
+    uint32 const grayLevel = skillLine->TrivialSkillLineRankHigh;
+    uint32 const greenLevel = (skillLine->TrivialSkillLineRankHigh + skillLine->MinSkillLineRank) / 2;
+    uint32 const yellowLevel = skillLine->MinSkillLineRank;
+    uint32 const skillValue = bot->GetSkillValue(skillLine->SkillLine);
+
+    if (skillValue >= grayLevel)
+        return "gray";
+    if (skillValue >= greenLevel)
+        return "green";
+    if (skillValue >= yellowLevel)
+        return "yellow";
+    return "orange";
+}
+
+std::string BuildRecipeMaterialsPayload(SpellInfo const* spellInfo, std::map<uint32, uint32> const& itemCounts, uint32& craftable)
+{
+    std::ostringstream materials;
+    bool first = true;
+    bool hasReagents = false;
+    craftable = 0;
+
+    for (uint32 index = 0; index < MAX_SPELL_REAGENTS; ++index)
+    {
+        if (spellInfo->Reagent[index] <= 0 || spellInfo->ReagentCount[index] <= 0)
+            continue;
+
+        uint32 const itemId = static_cast<uint32>(spellInfo->Reagent[index]);
+        uint32 const required = spellInfo->ReagentCount[index];
+        uint32 const available = itemCounts.count(itemId) ? itemCounts.at(itemId) : 0;
+        uint32 const possible = required ? available / required : 0;
+
+        if (!hasReagents || craftable > possible)
+            craftable = possible;
+        hasReagents = true;
+
+        if (!first)
+            materials << ';';
+        first = false;
+        materials << itemId << ':' << required << ':' << available;
+    }
+
+    if (!hasReagents)
+        craftable = 0;
+
+    return materials.str();
+}
+
+std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot, uint32 skillId)
+{
+    std::vector<ProfessionRecipeEntryData> entries;
+    if (!bot || !skillId)
+        return entries;
+
+    std::set<std::string> seenNames;
+    std::map<uint32, uint32> const itemCounts = BuildBotInventoryItemCounts(bot);
+
+    for (PlayerSpellMap::const_iterator it = bot->GetSpellMap().begin(); it != bot->GetSpellMap().end(); ++it)
+    {
+        if (!it->second)
+            continue;
+
+        if (it->second->State == PLAYERSPELL_REMOVED || !it->second->Active)
+            continue;
+
+        if (!(it->second->specMask & bot->GetActiveSpecMask()))
+            continue;
+
+        SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(it->first);
+        if (!skillLine || skillLine->SkillLine != skillId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(it->first);
+        if (!spellInfo || spellInfo->IsPassive() || !spellInfo->SpellName[0])
+            continue;
+
+        std::string const spellName = spellInfo->SpellName[0];
+        if (spellName.empty() || !seenNames.insert(spellName).second)
+            continue;
+
+        ProfessionRecipeEntryData entry;
+        entry.spellId = it->first;
+        entry.spellName = spellName;
+        entry.difficulty = GetRecipeDifficulty(bot, skillLine);
+        entry.materials = BuildRecipeMaterialsPayload(spellInfo, itemCounts, entry.craftable);
+
+        for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+            if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[effectIndex].ItemType > 0)
+                entry.itemId = spellInfo->Effects[effectIndex].ItemType;
+
+        entries.push_back(entry);
+    }
+
+    std::sort(entries.begin(), entries.end(), [](ProfessionRecipeEntryData const& left, ProfessionRecipeEntryData const& right)
+    {
+        if (left.difficulty != right.difficulty)
+            return left.difficulty < right.difficulty;
+        if (left.spellName != right.spellName)
+            return left.spellName < right.spellName;
+        return left.spellId < right.spellId;
+    });
+
     return entries;
 }
 
@@ -1233,6 +1559,61 @@ void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string con
     }
 
     SendAddonPacket(requester, replyType, "SB_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
+}
+
+void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+
+    std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_BEGIN", prefixPayload);
+
+    if (!bot)
+    {
+        SendAddonPacket(requester, replyType, "BOT_SKILLS_END", prefixPayload);
+        return;
+    }
+
+    for (BotSkillEntryData const& entry : BuildBotSkillEntries(bot))
+        SendAddonPacket(requester, replyType, "BOT_SKILLS_ITEM", BuildBotSkillEntryPayload(bot, requestToken, entry));
+
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
+}
+
+void SendProfessionRecipePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& skillIdValue, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+
+    std::ostringstream beginPayload;
+    beginPayload << UrlEncodeField(trimmedBotName) << kFieldSeparator << requestToken << kFieldSeparator << skillId;
+    SendAddonPacket(requester, replyType, "PROFESSION_RECIPES_BEGIN", beginPayload.str());
+
+    if (!bot || !skillId)
+    {
+        SendAddonPacket(requester, replyType, "PROFESSION_RECIPES_END", beginPayload.str());
+        return;
+    }
+
+    for (ProfessionRecipeEntryData const& entry : BuildProfessionRecipeEntries(bot, skillId))
+    {
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName())
+            << kFieldSeparator << requestToken
+            << kFieldSeparator << skillId
+            << kFieldSeparator << entry.spellId
+            << kFieldSeparator << entry.itemId
+            << kFieldSeparator << UrlEncodeField(entry.difficulty)
+            << kFieldSeparator << entry.craftable
+            << kFieldSeparator << UrlEncodeField(entry.materials);
+        SendAddonPacket(requester, replyType, "PROFESSION_RECIPES_ITEM", payload.str());
+    }
+
+    std::ostringstream endPayload;
+    endPayload << UrlEncodeField(bot->GetName()) << kFieldSeparator << requestToken << kFieldSeparator << skillId;
+    SendAddonPacket(requester, replyType, "PROFESSION_RECIPES_END", endPayload.str());
 }
 
 struct OutfitSetSnapshot
@@ -2478,6 +2859,21 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             std::pair<std::string, std::string> const spellbookRequest = SplitOnce(request.second, kFieldSeparator);
             SendSpellbookSnapshot(player, replyType, spellbookRequest.first, Trim(spellbookRequest.second));
+            return true;
+        }
+
+        if (requestType == "BOT_SKILLS")
+        {
+            std::pair<std::string, std::string> const skillRequest = SplitOnce(request.second, kFieldSeparator);
+            SendBotSkillPackets(player, replyType, skillRequest.first, Trim(skillRequest.second));
+            return true;
+        }
+
+        if (requestType == "PROFESSION_RECIPES")
+        {
+            std::pair<std::string, std::string> const recipeBotRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const recipeSkillRequest = SplitOnce(recipeBotRequest.second, kFieldSeparator);
+            SendProfessionRecipePackets(player, replyType, recipeBotRequest.first, recipeSkillRequest.first, Trim(recipeSkillRequest.second));
             return true;
         }
 
