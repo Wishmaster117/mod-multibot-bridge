@@ -3,6 +3,7 @@
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "ChatHelper.h"
+#include "GameObject.h"
 #include "Group.h"
 #include "Item.h"
 #include "ItemPackets.h"
@@ -16,6 +17,8 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "SpellMgr.h"
+#include "Unit.h"
+#include "World.h"
 #include "WorldPacket.h"
 
 #include <algorithm>
@@ -898,6 +901,80 @@ void SendQuestPackets(Player* player, ChatMsg replyType, std::string const& mode
     }
 
     SendAddonPacket(player, replyType, "QUESTS_DONE", token + std::string(1, kFieldSeparator) + mode);
+}
+
+void AppendGameObjectUnitLines(PlayerbotAI* botAI, std::vector<std::string>& lines, std::string const& title, std::string const& valueName)
+{
+    lines.push_back(title);
+    if (!botAI || !botAI->GetAiObjectContext())
+        return;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const units = *context->GetValue<GuidVector>(valueName);
+    for (ObjectGuid const guid : units)
+        if (Unit* const unit = botAI->GetUnit(guid))
+            lines.push_back(unit->GetNameForLocaleIdx(sWorld->GetDefaultDbcLocale()));
+}
+
+void AppendGameObjectLines(PlayerbotAI* botAI, std::vector<std::string>& lines, std::string const& title, std::string const& valueName)
+{
+    lines.push_back(title);
+    if (!botAI || !botAI->GetAiObjectContext())
+        return;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const objects = *context->GetValue<GuidVector>(valueName);
+    for (ObjectGuid const guid : objects)
+        if (GameObject* const go = botAI->GetGameObject(guid))
+            lines.push_back(ChatHelper::FormatGameobject(go));
+}
+
+std::vector<std::string> BuildGameObjectResultLines(Player* bot)
+{
+    std::vector<std::string> lines;
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    AppendGameObjectUnitLines(botAI, lines, "--- Targets ---", "possible targets");
+    AppendGameObjectUnitLines(botAI, lines, "--- Targets (All) ---", "all targets");
+    AppendGameObjectUnitLines(botAI, lines, "--- NPCs ---", "nearest npcs");
+    AppendGameObjectUnitLines(botAI, lines, "--- Corpses ---", "nearest corpses");
+    AppendGameObjectLines(botAI, lines, "--- Game objects ---", "nearest game objects");
+    return lines;
+}
+
+void SendGameObjectPacketsForBot(Player* requester, ChatMsg replyType, Player* bot, std::string const& token)
+{
+    if (!requester || !bot)
+        return;
+
+    std::string const botName = bot->GetName();
+    std::string const headerPayload = UrlEncodeField(botName) + std::string(1, kFieldSeparator) + token;
+    SendAddonPacket(requester, replyType, "GAMEOBJECTS_BEGIN", headerPayload);
+
+    for (std::string const& line : BuildGameObjectResultLines(bot))
+        SendAddonPacket(requester, replyType, "GAMEOBJECTS_ITEM", headerPayload + std::string(1, kFieldSeparator) + UrlEncodeField(line));
+
+    SendAddonPacket(requester, replyType, "GAMEOBJECTS_END", headerPayload);
+}
+
+void SendGameObjectPackets(Player* player, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(tokenValue);
+
+    if (!botName.empty())
+    {
+        if (Player* const bot = FindBotByName(player, botName))
+            SendGameObjectPacketsForBot(player, replyType, bot, token);
+        SendAddonPacket(player, replyType, "GAMEOBJECTS_DONE", token);
+        return;
+    }
+
+    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+            if (Player* const bot = it->second)
+                SendGameObjectPacketsForBot(player, replyType, bot, token);
+
+    SendAddonPacket(player, replyType, "GAMEOBJECTS_DONE", token);
 }
 
 static bool CompareSpellbookEntries(SpellbookEntryData const& left, SpellbookEntryData const& right)
@@ -2366,6 +2443,13 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const modeRequest = SplitOnce(request.second, kFieldSeparator);
             std::pair<std::string, std::string> const botRequest = SplitOnce(modeRequest.second, kFieldSeparator);
             SendQuestPackets(player, replyType, modeRequest.first, botRequest.first, botRequest.second);
+            return true;
+        }
+
+        if (requestType == "GAMEOBJECTS")
+        {
+            std::pair<std::string, std::string> const gameObjectRequest = SplitOnce(request.second, kFieldSeparator);
+            SendGameObjectPackets(player, replyType, gameObjectRequest.first, gameObjectRequest.second);
             return true;
         }
 
