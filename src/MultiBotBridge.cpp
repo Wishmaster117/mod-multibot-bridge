@@ -521,16 +521,28 @@ SkillLineAbilityEntry const* GetSkillLineAbilityForSpell(uint32 spellId)
     return it != spellSkillLines.end() ? it->second : nullptr;
 }
 
-bool IsProfessionSkillLine(uint32 skillId)
+bool IsSecondarySkillLine(uint32 skillId)
 {
-    SkillLineEntry const* const skillLine = sSkillLineStore.LookupEntry(skillId);
-    return skillLine && skillLine->categoryId == SKILL_CATEGORY_PROFESSION;
+    for (SkillDefinition const& definition : kSecondarySkillDefinitions)
+        if (definition.skillId == skillId)
+            return true;
+
+    return false;
 }
 
-bool IsProfessionSpell(uint32 spellId)
+bool IsSpellbookExcludedSkillLine(uint32 skillId)
+{
+    SkillLineEntry const* const skillLine = sSkillLineStore.LookupEntry(skillId);
+    if (skillLine && skillLine->categoryId == SKILL_CATEGORY_PROFESSION)
+        return true;
+
+    return IsSecondarySkillLine(skillId);
+}
+
+bool IsSpellbookExcludedSpell(uint32 spellId)
 {
     SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
-    return skillLine && IsProfessionSkillLine(skillLine->SkillLine);
+    return skillLine && IsSpellbookExcludedSkillLine(skillLine->SkillLine);
 }
 
 void AddSkillEntry(Player* bot, SkillDefinition const& definition, std::vector<BotSkillEntryData>& entries, std::set<uint32>& seen)
@@ -1182,7 +1194,7 @@ std::vector<SpellbookEntryData> BuildSpellbookEntries(Player* bot)
         if (!spellInfo || spellInfo->IsPassive() || !spellInfo->SpellName[0])
             continue;
 
-        if (IsProfessionSpell(it->first))
+        if (IsSpellbookExcludedSpell(it->first))
             continue;
 
         std::string const spellName = spellInfo->SpellName[0];
