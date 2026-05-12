@@ -363,12 +363,28 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Refresh inventory data with item links and icons.</td>
   </tr>
   <tr>
+    <td><code>GET~BANK</code></td>
+    <td>Refresh bot bank contents when a banker is available near the bot.</td>
+  </tr>
+  <tr>
+    <td><code>GET~GBANK</code></td>
+    <td>Refresh the bot guild bank snapshot without requiring the player to be in the same guild.</td>
+  </tr>
+  <tr>
     <td><code>GET~SPELLBOOK</code></td>
     <td>Refresh spellbook data.</td>
   </tr>
   <tr>
     <td><code>GET~BOT_SKILLS</code></td>
     <td>Refresh character info skills, professions, secondary skills, weapon skills and armor skills.</td>
+  </tr>
+  <tr>
+    <td><code>GET~BOT_REPUTATIONS</code></td>
+    <td>Refresh visible bot reputation standings for the Character Info frame.</td>
+  </tr>
+  <tr>
+    <td><code>GET~BOT_EMBLEMS</code></td>
+    <td>Refresh bot emblem counts and money for the Character Info currencies tab.</td>
   </tr>
   <tr>
     <td><code>GET~PROFESSION_RECIPES</code></td>
@@ -393,6 +409,10 @@ The exact payloads are consumed internally by the MultiBot addon.
   <tr>
     <td><code>RUN~CRAFT_RECIPE</code></td>
     <td>Ask a bot to craft one known profession recipe and return detailed cast failure reasons.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_ACTION</code></td>
+    <td>Run whitelisted inventory item actions such as bank deposit, bank withdraw, guild bank deposit and vendor buy.</td>
   </tr>
   <tr>
     <td><code>RUN~OUTFIT</code></td>

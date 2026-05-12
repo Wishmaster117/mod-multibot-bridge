@@ -15,6 +15,7 @@
 #include "PlayerbotMgr.h"
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
+#include "ReputationMgr.h"
 #include "AiObjectContext.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
@@ -57,6 +58,8 @@ void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& 
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 uint32 GetPct(uint32 current, uint32 max);
 
 std::string Trim(std::string const& value)
@@ -182,6 +185,15 @@ struct BotSkillEntryData
     std::string name;
     uint32 value = 0;
     uint32 maxValue = 0;
+};
+
+struct BotReputationEntryData
+{
+    uint32 factionId = 0;
+    std::string name;
+    uint32 rank = 0;
+    int32 value = 0;
+    int32 maxValue = 0;
 };
 
 struct SkillDefinition
@@ -603,6 +615,88 @@ std::string BuildBotSkillEntryPayload(Player* bot, std::string const& token, Bot
         << kFieldSeparator << entry.skillId
         << kFieldSeparator << UrlEncodeField(entry.key)
         << kFieldSeparator << UrlEncodeField(entry.name)
+        << kFieldSeparator << entry.value
+        << kFieldSeparator << entry.maxValue;
+    return out.str();
+}
+
+int32 GetReputationRankBase(ReputationRank rank)
+{
+    int32 base = ReputationMgr::Reputation_Cap + 1;
+    for (int32 i = MAX_REPUTATION_RANK - 1; i >= static_cast<int32>(rank); --i)
+        base -= ReputationMgr::PointsInRank[i];
+
+    return base;
+}
+
+BotReputationEntryData BuildBotReputationEntry(Player* bot, FactionEntry const* entry)
+{
+    BotReputationEntryData data;
+    if (!bot || !entry)
+        return data;
+
+    ReputationMgr& reputationMgr = bot->GetReputationMgr();
+    ReputationRank const rank = reputationMgr.GetRank(entry);
+    int32 const reputation = reputationMgr.GetReputation(entry->ID);
+    int32 const maxValue = ReputationMgr::PointsInRank[rank];
+    int32 value = reputation - GetReputationRankBase(rank);
+
+    if (value < 0)
+        value = 0;
+    if (value > maxValue)
+        value = maxValue;
+
+    data.factionId = entry->ID;
+    data.name = entry->name[0];
+    data.rank = static_cast<uint32>(rank);
+    data.value = value;
+    data.maxValue = maxValue;
+    return data;
+}
+
+std::vector<BotReputationEntryData> BuildBotReputationEntries(Player* bot)
+{
+    std::vector<BotReputationEntryData> entries;
+    if (!bot)
+        return entries;
+
+    ReputationMgr& reputationMgr = bot->GetReputationMgr();
+    FactionStateList const& stateList = reputationMgr.GetStateList();
+    entries.reserve(stateList.size());
+
+    for (auto const& itr : stateList)
+    {
+        FactionState const& faction = itr.second;
+        if (!(faction.Flags & FACTION_FLAG_VISIBLE))
+            continue;
+
+        if (faction.Flags & (FACTION_FLAG_HIDDEN | FACTION_FLAG_INVISIBLE_FORCED) &&
+            !(faction.Flags & FACTION_FLAG_SPECIAL))
+            continue;
+
+        FactionEntry const* const entry = sFactionStore.LookupEntry(faction.ID);
+        if (!entry)
+            continue;
+
+        entries.push_back(BuildBotReputationEntry(bot, entry));
+    }
+
+    std::sort(entries.begin(), entries.end(), [](BotReputationEntryData const& left, BotReputationEntryData const& right)
+    {
+        return left.name < right.name;
+    });
+
+    return entries;
+}
+
+std::string BuildBotReputationEntryPayload(Player* bot, std::string const& token, BotReputationEntryData const& entry)
+{
+    std::ostringstream out;
+    out << UrlEncodeField(bot->GetName())
+        << kFieldSeparator << token
+        << kFieldSeparator << entry.factionId
+        << kFieldSeparator << UrlEncodeField(entry.name)
+        << kFieldSeparator << entry.rank
         << kFieldSeparator << entry.value
         << kFieldSeparator << entry.maxValue;
     return out.str();
@@ -2090,6 +2184,72 @@ void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const
         SendAddonPacket(requester, replyType, "BOT_SKILLS_ITEM", BuildBotSkillEntryPayload(bot, requestToken, entry));
 
     SendAddonPacket(requester, replyType, "BOT_SKILLS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
+}
+
+void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+
+    std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
+    SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_BEGIN", prefixPayload);
+
+    if (!bot)
+    {
+        SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_END", prefixPayload);
+        return;
+    }
+
+    for (BotReputationEntryData const& entry : BuildBotReputationEntries(bot))
+        SendAddonPacket(requester, replyType, "BOT_REPUTATION_ITEM", BuildBotReputationEntryPayload(bot, requestToken, entry));
+
+    SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
+}
+
+void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    static std::array<uint32, 6> const emblemIds = {{
+        29434, // Badge of Justice
+        40752, // Emblem of Heroism
+        40753, // Emblem of Valor
+        45624, // Emblem of Conquest
+        47241, // Emblem of Triumph
+        49426  // Emblem of Frost
+    }};
+
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+
+    std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
+    SendAddonPacket(requester, replyType, "BOT_EMBLEMS_BEGIN", prefixPayload);
+
+    if (!bot)
+    {
+        SendAddonPacket(requester, replyType, "BOT_EMBLEMS_END", prefixPayload);
+        return;
+    }
+
+    for (uint32 const itemId : emblemIds)
+    {
+        ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+            continue;
+
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName())
+            << kFieldSeparator << requestToken
+            << kFieldSeparator << itemId
+            << kFieldSeparator << bot->GetItemCount(itemId, false);
+        SendAddonPacket(requester, replyType, "BOT_EMBLEM_ITEM", payload.str());
+    }
+
+    std::ostringstream moneyPayload;
+    moneyPayload << UrlEncodeField(bot->GetName())
+        << kFieldSeparator << requestToken
+        << kFieldSeparator << bot->GetMoney();
+    SendAddonPacket(requester, replyType, "BOT_EMBLEMS_MONEY", moneyPayload.str());
+
+    SendAddonPacket(requester, replyType, "BOT_EMBLEMS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
 }
 
 void SendProfessionRecipePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& skillIdValue, std::string const& requestToken)
@@ -3657,6 +3817,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             std::pair<std::string, std::string> const skillRequest = SplitOnce(request.second, kFieldSeparator);
             SendBotSkillPackets(player, replyType, skillRequest.first, Trim(skillRequest.second));
+            return true;
+        }
+
+        if (requestType == "BOT_REPUTATIONS")
+        {
+            std::pair<std::string, std::string> const reputationRequest = SplitOnce(request.second, kFieldSeparator);
+            SendBotReputationPackets(player, replyType, reputationRequest.first, Trim(reputationRequest.second));
+            return true;
+        }
+
+        if (requestType == "BOT_EMBLEMS")
+        {
+            std::pair<std::string, std::string> const emblemRequest = SplitOnce(request.second, kFieldSeparator);
+            SendBotEmblemPackets(player, replyType, emblemRequest.first, Trim(emblemRequest.second));
             return true;
         }
 
