@@ -368,7 +368,7 @@ The exact payloads are consumed internally by the MultiBot addon.
   </tr>
   <tr>
     <td><code>GET~GBANK</code></td>
-    <td>Refresh the bot guild bank snapshot without requiring the player to be in the same guild.</td>
+    <td>Refresh the bot guild bank snapshot and withdrawal-rights state without requiring the player to be in the same guild.</td>
   </tr>
   <tr>
     <td><code>GET~SPELLBOOK</code></td>
@@ -412,7 +412,7 @@ The exact payloads are consumed internally by the MultiBot addon.
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code></td>
-    <td>Run whitelisted inventory item actions such as bank deposit, bank withdraw, guild bank deposit and vendor buy.</td>
+    <td>Run whitelisted inventory item actions such as bank deposit, bank withdraw, guild bank deposit, guild bank withdraw and vendor buy.</td>
   </tr>
   <tr>
     <td><code>RUN~OUTFIT</code></td>
