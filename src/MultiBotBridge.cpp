@@ -3333,8 +3333,7 @@ SpellCastResult CastBridgeSpellDirect(Player* bot, SpellInfo const* spellInfo, U
     BuildBridgeSpellTargets(bot, spellInfo, target, itemTarget, targets);
     SpellCastResult const result = spell->prepare(&targets);
 
-    if (oldSelection)
-        bot->SetSelection(oldSelection);
+    bot->SetSelection(oldSelection);
 
     return result;
 }
@@ -3427,8 +3426,7 @@ BridgeSpellCheckData CheckBridgeSpellCast(Player* bot, PlayerbotAI* botAI, uint3
     data.result = spell->CheckCast(true);
     delete spell;
 
-    if (oldSelection)
-        bot->SetSelection(oldSelection);
+    bot->SetSelection(oldSelection);
 
     data.reason = GetBridgeSpellFailureReason(data.result);
     data.ok = data.reason == "OK";
@@ -3956,9 +3954,22 @@ uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCo
             return moved;
         }
 
-        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
-        bot->BankItem(dest, item, true);
-        moved += stackCount;
+        uint32 const remainingRequest = requestedCount > 0 ? requestedCount - moved : 0;
+        uint32 const toMove = remainingRequest > 0 && stackCount > remainingRequest ? remainingRequest : stackCount;
+
+        if (toMove == stackCount)
+        {
+            bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+            bot->BankItem(dest, item, true);
+        }
+        else
+        {
+            Item* const splitItem = SplitStackForExactTrade(bot, item, toMove, reason);
+            if (!splitItem)
+                return moved;
+            bot->BankItem(dest, splitItem, true);
+        }
+        moved += toMove;
 
         if (requestedCount > 0 && moved >= requestedCount)
             break;
@@ -3996,9 +4007,22 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
             return moved;
         }
 
-        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
-        bot->StoreItem(dest, item, true);
-        moved += stackCount;
+        uint32 const remainingRequest = requestedCount > 0 ? requestedCount - moved : 0;
+        uint32 const toMove = remainingRequest > 0 && stackCount > remainingRequest ? remainingRequest : stackCount;
+
+        if (toMove == stackCount)
+        {
+            bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+            bot->StoreItem(dest, item, true);
+        }
+        else
+        {
+            Item* const splitItem = SplitStackForExactTrade(bot, item, toMove, reason);
+            if (!splitItem)
+                return moved;
+            bot->StoreItem(dest, splitItem, true);
+        }
+        moved += toMove;
 
         if (requestedCount > 0 && moved >= requestedCount)
             break;
@@ -4049,17 +4073,23 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         uint32 const stackCount = item->GetCount();
         uint32 const playerSlot = item->GetSlot();
         uint32 const playerBag = item->GetBagSlot();
-        ObjectGuid const itemGuid = item->GetGUID();
-        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, 0);
 
-        if (Item* const remaining = bot->GetItemByPos(playerBag, playerSlot))
-            if (remaining->GetGUID() == itemGuid)
+        uint32 const remainingRequest = requestedCount > 0 ? requestedCount - moved : 0;
+        uint32 const toMove = remainingRequest > 0 && stackCount > remainingRequest ? remainingRequest : stackCount;
+
+        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, toMove);
+
+        if (toMove < stackCount)
+        {
+            Item* const newItem = bot->GetItemByPos(playerBag, playerSlot);
+            if (!newItem || newItem->GetEntry() != itemId)
             {
                 reason = "GUILD_BANK_FULL";
                 return moved;
             }
+        }
 
-        moved += stackCount;
+        moved += toMove;
 
         if (requestedCount > 0 && moved >= requestedCount)
             break;
@@ -4201,6 +4231,9 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
     uint32 bought = 0;
     for (uint32 i = 0; i < desired; ++i)
     {
+        if (requestedCount > 0 && bought >= requestedCount)
+            break;
+
         uint32 const price = uint32(std::floor(proto->BuyPrice * bot->GetReputationPriceDiscount(vendor)));
         if (price > 0 && bot->GetMoney() < price)
         {
@@ -5588,6 +5621,41 @@ void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string 
 
     for (Player* const bot : GetBridgeVisibleBots(requester))
     {
+        // Send inventory bag entries
+        SendBagEntryPackets(requester, replyType, bot, token);
+
+        // Send inventory item locations
+        PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (botAI)
+        {
+            std::vector<Item*> const items = botAI->GetInventoryItems();
+            for (Item* const item : items)
+            {
+                if (!item)
+                    continue;
+
+                ItemTemplate const* const proto = item->GetTemplate();
+                if (!proto)
+                    continue;
+
+                std::string locationLine = ChatHelper::FormatItem(proto, item->GetCount());
+                if (item->IsSoulBound())
+                    locationLine += " (soulbound)";
+
+                std::ostringstream locationPayload;
+                locationPayload << UrlEncodeField(bot->GetName())
+                    << kFieldSeparator << token
+                    << kFieldSeparator << static_cast<uint32>(item->GetBagSlot())
+                    << kFieldSeparator << static_cast<uint32>(item->GetSlot())
+                    << kFieldSeparator << proto->ItemId
+                    << kFieldSeparator << item->GetCount()
+                    << kFieldSeparator << UrlEncodeField(locationLine)
+                    << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+                SendAddonPacket(requester, replyType, "INV_ITEM_LOC", locationPayload.str());
+            }
+        }
+
+        // Send inventory summary
         InventorySummaryData const summary = BuildInventorySummary(bot);
         std::ostringstream payload;
         payload << UrlEncodeField(bot->GetName())
