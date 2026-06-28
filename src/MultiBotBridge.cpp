@@ -31,6 +31,7 @@
 #include "Unit.h"
 #include "World.h"
 #include "WorldPacket.h"
+#include "QuestPackets.h"
 
 #include <algorithm>
 #include <array>
@@ -4463,9 +4464,11 @@ void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string cons
 
     // EN: Native AzerothCore quest share is group-wide; empty target skips single-recipient pre-validation.
     // FR: Le partage de quête AzerothCore est global au groupe; une cible vide saute la pré-validation mono-destinataire.
-    WorldPacket packet;
+    WorldPacket packet(CMSG_PUSHQUESTTOPARTY);
     packet << questId;
-    bot->GetSession()->HandlePushQuestToParty(packet);
+    WorldPackets::Quest::PushQuestToParty pushQuest(std::move(packet));
+    pushQuest.Read();
+    bot->GetSession()->HandlePushQuestToParty(pushQuest);
 
     // EN: Bot recipients do not click the client popup; feed their AI the same packet used by playerbots auto-share.
     // FR: Les bots destinataires ne cliquent pas la fenêtre client; on injecte au bot AI le même paquet que l'auto-partage playerbots.
