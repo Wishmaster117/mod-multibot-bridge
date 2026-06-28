@@ -379,6 +379,14 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Refresh character info skills, professions, secondary skills, weapon skills and armor skills.</td>
   </tr>
   <tr>
+    <td><code>GET~INVENTORY_BULK</code></td>
+    <td>Refresh inventory data for multiple bots in a single request (bag entries and item locations).</td>
+  </tr>
+  <tr>
+    <td><code>GET~BOT_SKILLS_BULK</code></td>
+    <td>Refresh skills data for multiple bots in a single request.</td>
+  </tr>
+  <tr>
     <td><code>GET~BOT_REPUTATIONS</code></td>
     <td>Refresh visible bot reputation standings for the Character Info frame.</td>
   </tr>
@@ -415,6 +423,34 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Ask a bot to craft one known profession recipe and return detailed cast failure reasons.</td>
   </tr>
   <tr>
+    <td><code>RUN~QUEST_ABANDON</code></td>
+    <td>Abandon a quest from the bot's log.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~QUEST_SHARE</code></td>
+    <td>Share a quest to the bot's group (empty target = group-wide share).</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_EQUIP</code></td>
+    <td>Equip an item with slot hint (<code>AUTO</code>, <code>BAG</code>, <code>MAIN_HAND</code>, <code>OFF_HAND</code>, <code>RANGED</code>).</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_TRADE</code></td>
+    <td>Trade an item to another player/bot with optional count.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~CAST_SPELL</code></td>
+    <td>Cast a spell with optional target and detailed failure reasons mapped from <code>SpellCastResult</code>.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TALENT_APPLY</code></td>
+    <td>Apply a talent build (including reset via <code>0-0-0</code>).</td>
+  </tr>
+  <tr>
+    <td><code>RUN~CRAFT_RECIPE_TARGET</code></td>
+    <td>Craft a profession recipe targeting a specific item (bag, equipped, or trade slot).</td>
+  </tr>
+  <tr>
     <td><code>RUN~ITEM_ACTION</code></td>
     <td>Run whitelisted inventory item actions such as bank deposit, bank withdraw, guild bank deposit, guild bank withdraw and vendor buy.</td>
   </tr>
@@ -425,6 +461,18 @@ The exact payloads are consumed internally by the MultiBot addon.
   <tr>
     <td><code>RUN~TRAINER_LEARN</code></td>
     <td>Ask a bot to learn one trainer spell or all available trainer spells after revalidating the selected trainer.</td>
+  </tr>
+  <tr>
+    <td><code>INV_BAG</code></td>
+    <td>Send bag entries with type, slots, and item ID for inventory view.</td>
+  </tr>
+  <tr>
+    <td><code>INV_ITEM_LOC</code></td>
+    <td>Send exact bag/slot locations for each inventory item.</td>
+  </tr>
+  <tr>
+    <td><code>INV_EQUIP_LOC</code></td>
+    <td>Send equipped items with slot index and count.</td>
   </tr>
   <tr>
     <td><code>RUN~RTI</code></td>
