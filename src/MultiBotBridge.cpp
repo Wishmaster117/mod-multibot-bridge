@@ -224,6 +224,12 @@ bool BridgeConsoleLogsEnabled()
 }
 
 std::string Trim(std::string const& value);
+std::string ToUpper(std::string value);
+
+bool SameName(std::string const& left, std::string const& right)
+{
+    return ToUpper(Trim(left)) == ToUpper(Trim(right));
+}
 
 std::vector<std::string> GetAcceptedAddonPrefixes()
 {
@@ -296,6 +302,7 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
 void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
 void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 slot, uint32 specIndex);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
+void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId, std::string const& targetName);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
@@ -6856,6 +6863,72 @@ bool RegisterQuestAbandonToken(Player* requester, std::string const& token)
     return true;
 }
 
+void SendQuestShareResult(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& token, bool ok, std::string const& reason, uint32 accepted)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName) << kFieldSeparator << token << kFieldSeparator
+        << (ok ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << "BOT_ACCEPTS:" << accepted;
+    SendAddonPacket(requester, replyType, "QUEST_SHARE", payload.str());
+}
+
+void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId, std::string const& targetName)
+{
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, Trim(botName));
+    std::string const effectiveName = bot ? bot->GetName() : Trim(botName);
+    if (!bot || !bot->GetGroup())
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, bot ? "INVALID_TARGET" : "NO_BOT", 0);
+
+    Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest)
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, "INVALID_QUEST_ID", 0);
+
+    uint8 questSlot = MAX_QUEST_LOG_SIZE;
+    for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        if (bot->GetQuestSlotQuestId(slot) == questId)
+            questSlot = slot;
+    if (questSlot >= MAX_QUEST_LOG_SIZE || !bot->CanShareQuest(questId))
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, questSlot >= MAX_QUEST_LOG_SIZE ? "MISSING_QUEST" : "NOT_SHAREABLE", 0);
+
+    Player* target = nullptr;
+    std::string const decodedTarget = Trim(UrlDecodeField(targetName));
+    if (!decodedTarget.empty())
+    {
+        target = SameName(requester->GetName(), decodedTarget) ? requester : ObjectAccessor::FindPlayerByName(decodedTarget, false);
+        if (!target || target == bot || target->GetGroup() != bot->GetGroup() || !target->IsInMap(bot))
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "INVALID_TARGET", 0);
+        if (!target->SatisfyQuestStatus(quest, false) || target->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE)
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "TARGET_HAS_QUEST", 0);
+        if (!target->CanTakeQuest(quest, false) || !target->SatisfyQuestLog(false))
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "NOT_SHAREABLE", 0);
+    }
+
+    WorldPacket packet(CMSG_PUSHQUESTTOPARTY);
+    packet << questId;
+    WorldPackets::Quest::PushQuestToParty pushQuest(std::move(packet));
+    pushQuest.Read();
+    bot->GetSession()->HandlePushQuestToParty(pushQuest);
+
+    uint32 accepted = 0;
+    for (GroupReference* itr = bot->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* const member = itr->GetSource();
+        if (!member || member == bot || !member->IsInWorld() || !member->IsInMap(bot) ||
+            (!decodedTarget.empty() && !SameName(member->GetName(), decodedTarget)))
+            continue;
+        PlayerbotAI* const ai = GET_PLAYERBOT_AI(member);
+        if (!ai || !member->SatisfyQuestStatus(quest, false) || member->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE ||
+            !member->CanTakeQuest(quest, false) || !member->SatisfyQuestLog(false) || member->GetDivider().IsEmpty())
+            continue;
+        WorldPacket accept(CMSG_PUSHQUESTTOPARTY, 20);
+        accept << questId;
+        ai->HandleMasterIncomingPacket(accept);
+        ++accepted;
+    }
+    SendQuestShareResult(requester, replyType, effectiveName, token, true, "OK", accepted);
+}
+
 void RunQuestAbandonCommand(
     Player* requester,
     ChatMsg replyType,
@@ -12563,6 +12636,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SPEC");
 
         RunTalentSpecApplyCommand(player, replyType, botName, fields[1], slot, specIndex);
+        return true;
+    }
+
+    if (requestType == "QUEST_SHARE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        RunQuestShareCommand(player, replyType, fields[1], fields[2], questId, fields[4]);
         return true;
     }
 
