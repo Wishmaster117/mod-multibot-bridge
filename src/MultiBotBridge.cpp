@@ -276,6 +276,7 @@ bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken);
+void SendBotSkillsBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken);
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason);
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -11672,6 +11673,27 @@ void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string 
     SendAddonPacket(requester, replyType, "INV_BULK_END", token);
 }
 
+void SendBotSkillsBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_BEGIN", token);
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        for (BotSkillEntryData const& entry : BuildBotSkillEntries(bot))
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                << kFieldSeparator << entry.skillId << kFieldSeparator << UrlEncodeField(entry.category)
+                << kFieldSeparator << UrlEncodeField(entry.key) << kFieldSeparator << UrlEncodeField(entry.name)
+                << kFieldSeparator << entry.value << kFieldSeparator << entry.maxValue;
+            SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_ITEM", payload.str());
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_END", token);
+}
+
 void SendStatsPackets(Player* player, ChatMsg replyType)
 {
     for (Player* const bot : GetBridgeVisibleBots(player))
@@ -12262,6 +12284,17 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[1]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
             SendInventoryBulkPackets(player, replyType, fields[1]);
+            return true;
+        }
+
+        if (requestType == "BOT_SKILLS_BULK")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+            SendBotSkillsBulkPackets(player, replyType, fields[1]);
             return true;
         }
 
