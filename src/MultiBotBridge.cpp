@@ -289,6 +289,7 @@ bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opco
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
+void RunBagMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 sourceBagIndex, uint8 targetBagIndex);
 void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void RunInventoryItemDepositExactCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void RunLootRuleItemCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& actionValue, uint32 itemId);
@@ -7486,6 +7487,62 @@ void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const
     SendAddonPacket(requester, replyType, "GROUP_ROLL_ACK", payload.str());
 }
 
+void RunBagMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 sourceBagIndex, uint8 targetBagIndex)
+{
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, Trim(botName));
+    std::string const effectiveName = bot ? bot->GetName() : Trim(botName);
+    std::string reason = "OK";
+    bool changed = false;
+
+    if (!ConsumeInventoryItemMoveRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!RegisterInventoryItemMoveToken(requester, token))
+            reason = "DUPLICATE";
+        else if (!bot->GetSession() || !bot->IsInWorld())
+            reason = "BOT_UNAVAILABLE";
+        else if (sourceBagIndex < 1 || sourceBagIndex > 4 || targetBagIndex < 1 || targetBagIndex > 4)
+            reason = "BAD_POSITION";
+        else if (sourceBagIndex == targetBagIndex)
+            reason = "SAME_POSITION";
+        else
+        {
+            uint8 const sourceSlot = static_cast<uint8>(INVENTORY_SLOT_BAG_START + sourceBagIndex - 1);
+            uint8 const targetSlot = static_cast<uint8>(INVENTORY_SLOT_BAG_START + targetBagIndex - 1);
+            Item* const source = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, sourceSlot);
+            Item* const destination = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, targetSlot);
+            if (!source || !source->IsBag())
+                reason = "MISSING_ITEM";
+            else if (destination)
+                reason = "TARGET_NOT_EMPTY";
+            else
+            {
+                bot->SwapItem((static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | sourceSlot,
+                    (static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | targetSlot);
+                changed = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, targetSlot) == source &&
+                    bot->GetItemByPos(INVENTORY_SLOT_BAG_0, sourceSlot) == nullptr;
+                if (!changed)
+                    reason = "POSTCONDITION_FAILED";
+            }
+        }
+    }
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveName) << kFieldSeparator << token << kFieldSeparator
+        << (changed ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << static_cast<uint32>(sourceBagIndex)
+        << kFieldSeparator << static_cast<uint32>(targetBagIndex);
+    SendAddonPacket(requester, replyType, "BAG_MOVE", payload.str());
+}
+
 void RunInventoryItemMoveCommand(
     Player* requester,
     ChatMsg replyType,
@@ -13202,6 +13259,21 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunInventoryItemSellCommand(
             player, replyType, fields[1], fields[2],
             static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount);
+        return true;
+    }
+
+    if (requestType == "BAG_MOVE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 source = 0;
+        uint32 target = 0;
+        if (!TryParseUint32Field(fields[3], 1, 4, source) || !TryParseUint32Field(fields[4], 1, 4, target))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_POSITION");
+        RunBagMoveCommand(player, replyType, fields[1], fields[2], static_cast<uint8>(source), static_cast<uint8>(target));
         return true;
     }
 
