@@ -4009,6 +4009,23 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
         bot->GetMaxKeyringSize(),
         0);
 
+    // GetInventoryItems() only covers carried items, so emit current equipment separately.
+    for (uint8 equipSlot = EQUIPMENT_SLOT_START; equipSlot < EQUIPMENT_SLOT_END; ++equipSlot)
+    {
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+        if (!item || !item->GetTemplate())
+            continue;
+
+        std::ostringstream payload;
+        payload << bot->GetName()
+                << kFieldSeparator << requestToken
+                << kFieldSeparator << static_cast<uint32>(equipSlot)
+                << kFieldSeparator << item->GetTemplate()->ItemId
+                << kFieldSeparator << item->GetCount()
+                << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+        SendAddonPacket(requester, replyType, "INV_EQUIP_LOC", payload.str());
+    }
+
     std::vector<Item*> const items = botAI->GetInventoryItems();
     for (Item* const item : items)
     {
