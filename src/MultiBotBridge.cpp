@@ -225,6 +225,7 @@ bool BridgeConsoleLogsEnabled()
 
 std::string Trim(std::string const& value);
 std::string ToUpper(std::string value);
+std::string UrlEncodeField(std::string const& value);
 
 bool SameName(std::string const& left, std::string const& right)
 {
@@ -299,10 +300,21 @@ void RunProfessionRecipeTargetCommand(Player* requester, ChatMsg replyType, std:
 void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName);
+void SendNativeActionResult(Player* requester, ChatMsg replyType, char const* opcode, std::string const& botName, std::string const& token, bool ok, std::string const& reason, std::string const& extra = "")
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName) << kFieldSeparator << token << kFieldSeparator
+        << (ok ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason);
+    if (!extra.empty()) payload << kFieldSeparator << UrlEncodeField(extra);
+    SendAddonPacket(requester, replyType, opcode, payload.str());
+}
+
 void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
 void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 slot, uint32 specIndex);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
 void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId, std::string const& targetName);
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
@@ -5325,6 +5337,256 @@ std::vector<BulkBagData> BuildBulkBags(Player* bot)
     return bags;
 }
 
+Player* FindAllowedPlayerTarget(Player* requester, std::string const& encodedTargetName)
+{
+    std::string const targetName = Trim(UrlDecodeField(encodedTargetName));
+    if (targetName.empty())
+        return nullptr;
+    if (requester && SameName(requester->GetName(), targetName))
+        return requester;
+    if (requester)
+        if (Player* const bot = FindBotByName(requester, targetName))
+            return bot;
+    std::string normalizedName = targetName;
+    if (!normalizePlayerName(normalizedName))
+        return nullptr;
+    Player* const target = ObjectAccessor::FindPlayerByName(normalizedName, false);
+    if (target && requester && requester->GetGroup() && target->GetGroup() == requester->GetGroup())
+        return target;
+    return nullptr;
+}
+
+Unit* ResolveSpellTarget(Player* requester, Player* bot, PlayerbotAI* botAI, std::string const& encodedTargetName)
+{
+    std::string const targetName = Trim(UrlDecodeField(encodedTargetName));
+    if (!bot)
+        return nullptr;
+
+    if (targetName.empty())
+    {
+        if (Unit* const selected = bot->GetSelectedUnit())
+            return selected;
+
+        return bot;
+    }
+
+    if (Player* const targetPlayer = FindAllowedPlayerTarget(requester, targetName))
+        return targetPlayer;
+
+    if (!botAI || !botAI->GetAiObjectContext())
+        return nullptr;
+
+    static char const* const valueNames[] = { "possible targets", "all targets", "nearest npcs" };
+    for (char const* const valueName : valueNames)
+    {
+        GuidVector const units = *botAI->GetAiObjectContext()->GetValue<GuidVector>(valueName);
+        for (ObjectGuid const guid : units)
+        {
+            Unit* const unit = botAI->GetUnit(guid);
+            if (unit && SameName(unit->GetName(), targetName))
+                return unit;
+        }
+    }
+
+    return nullptr;
+}
+
+std::string GetBridgeSpellFailureReason(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_CAST_OK:
+        case SPELL_FAILED_SUCCESS:
+            return "OK";
+        case SPELL_FAILED_NOT_KNOWN:
+            return "MISSING_SPELL";
+        case SPELL_FAILED_BAD_TARGETS:
+        case SPELL_FAILED_BAD_IMPLICIT_TARGETS:
+        case SPELL_FAILED_NO_VALID_TARGETS:
+            return "INVALID_TARGET";
+        case SPELL_FAILED_OUT_OF_RANGE:
+        case SPELL_FAILED_TOO_CLOSE:
+            return "OUT_OF_RANGE";
+        case SPELL_FAILED_NO_POWER:
+            return "NO_MANA";
+        case SPELL_FAILED_NOT_READY:
+        case SPELL_FAILED_ITEM_NOT_READY:
+            return "COOLDOWN";
+        case SPELL_FAILED_REAGENTS:
+            return "REAGENTS";
+        case SPELL_FAILED_NEED_MORE_ITEMS:
+            return "NO_MATERIALS";
+        case SPELL_FAILED_MOVING:
+            return "MOVING";
+        case SPELL_FAILED_NOT_IN_CONTROL:
+        case SPELL_FAILED_STUNNED:
+        case SPELL_FAILED_CONFUSED:
+        case SPELL_FAILED_FLEEING:
+            return "LOST_CONTROL";
+        case SPELL_FAILED_TRY_AGAIN:
+        case SPELL_FAILED_SPELL_IN_PROGRESS:
+            return "TRY_AGAIN";
+        case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+            return "REQUIRES_SPELL_FOCUS";
+        case SPELL_FAILED_EQUIPPED_ITEM:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_MAINHAND:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_OFFHAND:
+        case SPELL_FAILED_TOTEM_CATEGORY:
+        case SPELL_FAILED_TOTEMS:
+            return "MISSING_TOOLS";
+        default:
+            return "CAST_FAILED";
+    }
+}
+
+struct BridgeSpellCheckData
+{
+    bool ok = false;
+    std::string reason = "CAST_FAILED";
+    SpellCastResult result = SPELL_FAILED_ERROR;
+};
+
+void BuildBridgeSpellTargets(Player* bot, SpellInfo const* spellInfo, Unit* target, Item* itemTarget, SpellCastTargets& targets)
+{
+    if (!target)
+        target = bot;
+
+    if (spellInfo->Effects[0].Effect != SPELL_EFFECT_OPEN_LOCK &&
+        (spellInfo->Targets & TARGET_FLAG_ITEM || spellInfo->Targets & TARGET_FLAG_GAMEOBJECT_ITEM))
+    {
+        // EN: Trade enchant/enhancement spells target the other player's not-traded slot.
+        // FR: Les enchantements/améliorations en échange ciblent l'emplacement non échangé de l'autre joueur.
+        if (itemTarget && bot->GetTrader())
+            targets.SetTradeItemTarget(bot);
+        else
+            targets.SetItemTarget(itemTarget);
+    }
+    else if (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
+        targets.SetDst(*target);
+    else if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+        targets.SetDst(*bot);
+    else
+        targets.SetUnitTarget(target);
+}
+
+SpellCastResult CastBridgeSpellDirect(Player* bot, SpellInfo const* spellInfo, Unit* target, Item* itemTarget = nullptr)
+{
+    if (!bot || !spellInfo)
+        return SPELL_FAILED_ERROR;
+
+    if (!target)
+        target = bot;
+
+    ObjectGuid const oldSelection = bot->GetSelectedUnit() ? bot->GetSelectedUnit()->GetGUID() : ObjectGuid();
+    bot->SetSelection(target->GetGUID());
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    BuildBridgeSpellTargets(bot, spellInfo, target, itemTarget, targets);
+    SpellCastResult const result = spell->prepare(&targets);
+
+    bot->SetSelection(oldSelection);
+
+    return result;
+}
+
+BridgeSpellCheckData CheckBridgeSpellCast(Player* bot, PlayerbotAI* botAI, uint32 spellId, Unit* target, Item* itemTarget = nullptr)
+{
+    BridgeSpellCheckData data;
+
+    if (!bot || !botAI || !spellId)
+    {
+        data.reason = "BAD_REQUEST";
+        return data;
+    }
+
+    if (!target)
+        target = bot;
+
+    if (!target->IsInWorld())
+    {
+        data.reason = "INVALID_TARGET";
+        return data;
+    }
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+    {
+        data.reason = "LOST_CONTROL";
+        return data;
+    }
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+    {
+        data.reason = "UNKNOWN_SPELL";
+        return data;
+    }
+
+    Pet* const pet = bot->GetPet();
+    if (!bot->HasSpell(spellId) && !(pet && pet->HasSpell(spellId)))
+    {
+        data.result = SPELL_FAILED_NOT_KNOWN;
+        data.reason = "MISSING_SPELL";
+        return data;
+    }
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+    {
+        data.reason = "TRY_AGAIN";
+        return data;
+    }
+
+    if (bot->HasSpellCooldown(spellId))
+    {
+        data.result = SPELL_FAILED_NOT_READY;
+        data.reason = "COOLDOWN";
+        return data;
+    }
+
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+    {
+        data.reason = "CAST_FAILED";
+        return data;
+    }
+
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        data.result = SPELL_FAILED_NOT_STANDING;
+        data.reason = "TRY_AGAIN";
+        return data;
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+    {
+        data.result = SPELL_FAILED_MOVING;
+        data.reason = "MOVING";
+        return data;
+    }
+
+    ObjectGuid const oldSelection = bot->GetSelectedUnit() ? bot->GetSelectedUnit()->GetGUID() : ObjectGuid();
+    bot->SetSelection(target->GetGUID());
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    BuildBridgeSpellTargets(bot, spellInfo, target, itemTarget, targets);
+
+    // EN: CheckCast reads Spell::m_targets; validate the same target set that CastSpell will prepare.
+    // FR: CheckCast lit Spell::m_targets; valider la même cible que CastSpell préparera.
+    spell->m_targets = targets;
+    data.result = spell->CheckCast(true);
+    delete spell;
+
+    bot->SetSelection(oldSelection);
+
+    data.reason = GetBridgeSpellFailureReason(data.result);
+    data.ok = data.reason == "OK";
+    return data;
+}
+
+
 uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!bot || !itemId)
@@ -6497,6 +6759,55 @@ bool ValidateTalentApplyBuild(
 
     return parsedPoints == requestedPoints;
 }
+
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 spellId = 0;
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    if (!bot)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "NO_BOT");
+        return;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "NO_AI");
+        return;
+    }
+
+    if (!TryParseUint32Field(spellIdValue, 1, std::numeric_limits<uint32>::max(), spellId))
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "BAD_REQUEST");
+        return;
+    }
+
+    Unit* const target = ResolveSpellTarget(requester, bot, botAI, encodedTargetName);
+    if (!target)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "INVALID_TARGET");
+        return;
+    }
+
+    BridgeSpellCheckData const check = CheckBridgeSpellCast(bot, botAI, spellId, target);
+    if (!check.ok)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, check.reason, std::to_string(static_cast<uint32>(check.result)));
+        return;
+    }
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    SpellCastResult const result = CastBridgeSpellDirect(bot, spellInfo, target);
+    bool const ok = result == SPELL_CAST_OK;
+    SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, ok, ok ? "OK" : GetBridgeSpellFailureReason(result), ok ? "" : std::to_string(static_cast<uint32>(result)));
+}
+
 
 void RunTalentApplyCommand(
     Player* requester,
@@ -12636,6 +12947,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_SPEC");
 
         RunTalentSpecApplyCommand(player, replyType, botName, fields[1], slot, specIndex);
+        return true;
+    }
+
+    if (requestType == "CAST_SPELL")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 spellId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), spellId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        RunSpellCastCommand(player, replyType, fields[1], fields[2], fields[3], fields[4]);
         return true;
     }
 
