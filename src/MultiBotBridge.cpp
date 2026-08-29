@@ -275,6 +275,7 @@ bool ConsumeSelfBotRequestRateLimit(Player* requester);
 bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
+void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken);
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason);
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -5265,6 +5266,55 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
 
     botAI->HandleCommand(CHAT_MSG_WHISPER, command, requester);
     return true;
+}
+
+struct BulkBagData
+{
+    uint8 index = 0;
+    uint32 itemId = 0;
+    std::string link;
+    uint32 slots = 0;
+    std::string type;
+};
+
+std::string GetBulkBagType(ItemTemplate const* proto)
+{
+    if (!proto)
+        return "BACKPACK";
+    if (proto->BagFamily & BAG_FAMILY_MASK_ARROWS)
+        return "QUIVER";
+    if (proto->BagFamily & BAG_FAMILY_MASK_BULLETS)
+        return "AMMO_POUCH";
+    if (proto->BagFamily & BAG_FAMILY_MASK_SOUL_SHARDS)
+        return "SOUL_SHARD";
+    if (proto->Class == ITEM_CLASS_CONTAINER && proto->SubClass == ITEM_SUBCLASS_CONTAINER)
+        return "NORMAL";
+    return "UNKNOWN";
+}
+
+std::vector<BulkBagData> BuildBulkBags(Player* bot)
+{
+    std::vector<BulkBagData> bags(1);
+    bags[0].type = "BACKPACK";
+    bags[0].slots = 16;
+    if (!bot)
+        return bags;
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* const container = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+        if (!container)
+            continue;
+        ItemTemplate const* const proto = container->GetTemplate();
+        BulkBagData entry;
+        entry.index = static_cast<uint8>(bag - INVENTORY_SLOT_BAG_START + 1);
+        entry.itemId = proto ? proto->ItemId : 0;
+        entry.link = proto ? ChatHelper::FormatItem(proto, 1) : "";
+        entry.slots = container->GetBagSize();
+        entry.type = GetBulkBagType(proto);
+        bags.push_back(entry);
+    }
+    return bags;
 }
 
 uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
@@ -11571,6 +11621,57 @@ std::string BuildStatsPayload(Player* player, std::string const& botName)
     return BuildStatsPayload(bot);
 }
 
+void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    SendAddonPacket(requester, replyType, "INV_BULK_BEGIN", token);
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        for (BulkBagData const& bag : BuildBulkBags(bot))
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                << kFieldSeparator << static_cast<uint32>(bag.index)
+                << kFieldSeparator << bag.itemId << kFieldSeparator << UrlEncodeField(bag.link)
+                << kFieldSeparator << bag.slots << kFieldSeparator << UrlEncodeField(bag.type);
+            SendAddonPacket(requester, replyType, "INV_BAG", payload.str());
+        }
+
+        PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (botAI)
+        {
+            for (Item* const item : botAI->GetInventoryItems())
+            {
+                if (!item || !item->GetTemplate())
+                    continue;
+                ItemTemplate const* const proto = item->GetTemplate();
+                std::string text = ChatHelper::FormatItem(proto, item->GetCount());
+                if (item->IsSoulBound())
+                    text += " (soulbound)";
+                std::ostringstream payload;
+                payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                    << kFieldSeparator << static_cast<uint32>(item->GetBagSlot())
+                    << kFieldSeparator << static_cast<uint32>(item->GetSlot())
+                    << kFieldSeparator << proto->ItemId << kFieldSeparator << item->GetCount()
+                    << kFieldSeparator << UrlEncodeField(text)
+                    << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+                SendAddonPacket(requester, replyType, "INV_ITEM_LOC", payload.str());
+            }
+        }
+
+        InventorySummaryData const summary = BuildInventorySummary(bot);
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+            << kFieldSeparator << summary.gold << kFieldSeparator << summary.silver
+            << kFieldSeparator << summary.copper << kFieldSeparator << summary.bagUsed
+            << kFieldSeparator << summary.bagTotal;
+        SendAddonPacket(requester, replyType, "INV_BULK_ITEM", payload.str());
+    }
+
+    SendAddonPacket(requester, replyType, "INV_BULK_END", token);
+}
+
 void SendStatsPackets(Player* player, ChatMsg replyType)
 {
     for (Player* const bot : GetBridgeVisibleBots(player))
@@ -12150,6 +12251,17 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             SendEnchantTradePackets(player, replyType, fields[1], fields[2]);
+            return true;
+        }
+
+        if (requestType == "INVENTORY_BULK")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+            SendInventoryBulkPackets(player, replyType, fields[1]);
             return true;
         }
 
