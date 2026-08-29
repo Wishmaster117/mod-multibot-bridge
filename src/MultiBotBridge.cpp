@@ -59,6 +59,7 @@ namespace
 {
 char const* const kAddonPrefix = "MBOT";
 char const* const kAddonEnvelope = "MBOT\t";
+std::string gCurrentReplyPrefix = kAddonPrefix;
 char const* const kBridgeName = "mod-multibot-bridge";
 char const* const kProtocolVersion = "1";
 char const kFieldSeparator = '~';
@@ -221,6 +222,52 @@ bool BridgeConsoleLogsEnabled()
 {
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
 }
+
+std::string Trim(std::string const& value);
+
+std::vector<std::string> GetAcceptedAddonPrefixes()
+{
+    std::string const configured = sConfigMgr->GetOption<std::string>("MultiBotBridge.AcceptPrefixes", kAddonPrefix);
+    std::vector<std::string> prefixes;
+    std::size_t start = 0;
+    while (start <= configured.size())
+    {
+        std::size_t const end = configured.find(',', start);
+        std::string prefix = Trim(configured.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (!prefix.empty() && std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end())
+            prefixes.push_back(prefix);
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+
+    if (prefixes.empty())
+        prefixes.emplace_back(kAddonPrefix);
+    return prefixes;
+}
+
+bool IsAcceptedAddonPrefix(std::string const& prefix)
+{
+    std::vector<std::string> const prefixes = GetAcceptedAddonPrefixes();
+    return std::find(prefixes.begin(), prefixes.end(), prefix) != prefixes.end();
+}
+
+class ReplyPrefixScope final
+{
+public:
+    explicit ReplyPrefixScope(std::string prefix) : previous_(gCurrentReplyPrefix)
+    {
+        gCurrentReplyPrefix = std::move(prefix);
+    }
+
+    ~ReplyPrefixScope()
+    {
+        gCurrentReplyPrefix = std::move(previous_);
+    }
+
+private:
+    std::string previous_;
+};
 
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
@@ -536,18 +583,27 @@ std::string SanitizeLogValue(std::string const& value, std::size_t maxLength)
     return out;
 }
 
-BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& payload, std::string& reason)
+BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& prefix, std::string& payload, std::string& reason)
 {
+    prefix.clear();
     payload.clear();
     reason.clear();
 
     if (lang != LANG_ADDON)
         return BridgePayloadStatus::NotBridge;
 
-    std::size_t const envelopeLength = std::char_traits<char>::length(kAddonEnvelope);
-    if (msg.size() < envelopeLength || msg.compare(0, envelopeLength, kAddonEnvelope) != 0)
+    std::size_t const separator = msg.find('\t');
+    if (separator == std::string::npos || separator == 0)
         return BridgePayloadStatus::NotBridge;
 
+    prefix = msg.substr(0, separator);
+    if (!IsAcceptedAddonPrefix(prefix))
+    {
+        prefix.clear();
+        return BridgePayloadStatus::NotBridge;
+    }
+
+    std::size_t const envelopeLength = separator + 1;
     if (msg.size() > kMaxBridgeWireLength)
     {
         reason = "WIRE_TOO_LONG";
@@ -10911,7 +10967,8 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
     if (!player || !player->GetSession())
         return;
 
-    std::string wire = std::string(kAddonEnvelope) + opcode;
+    std::string const replyPrefix = IsAcceptedAddonPrefix(gCurrentReplyPrefix) ? gCurrentReplyPrefix : std::string(kAddonPrefix);
+    std::string wire = replyPrefix + "\t" + opcode;
     if (!payload.empty())
         wire += std::string(1, kFieldSeparator) + payload;
 
@@ -12875,13 +12932,15 @@ public:
         if (!player)
             return false;
 
+        std::string prefix;
         std::string payload;
         std::string reason;
-        BridgePayloadStatus const status = TryExtractBridgePayload(lang, msg, payload, reason);
+        BridgePayloadStatus const status = TryExtractBridgePayload(lang, msg, prefix, payload, reason);
         if (status == BridgePayloadStatus::NotBridge)
             return false;
 
         ChatMsg const replyType = NormalizeReplyChatType(type);
+        ReplyPrefixScope const replyPrefixScope(prefix);
         if (status == BridgePayloadStatus::Invalid)
         {
             if (BridgeConsoleLogsEnabled())
