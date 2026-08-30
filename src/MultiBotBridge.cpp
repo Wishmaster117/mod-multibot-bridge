@@ -36,6 +36,11 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Spell.h"
+
+inline bool IsSelfBot(Player* player)
+{
+    return player && GET_PLAYERBOT_AI(player) && GET_PLAYERBOT_AI(player)->GetMaster() == player;
+}
 #include "SpellMgr.h"
 #include "Trainer.h"
 #include "Unit.h"
@@ -10326,7 +10331,9 @@ void RunSelfActionCommand(
             {
                 uint32 const quality = static_cast<uint32>(sPlayerbotAIConfig.autoGearQualityLimit);
                 uint32 const ilvl = static_cast<uint32>(sPlayerbotAIConfig.autoGearScoreLimit);
-                PlayerbotFactory::AutoGear(requester, quality, ilvl, true);
+                uint32 gs = ilvl == 0 ? 0 : PlayerbotFactory::CalcMixedGearScore(ilvl, quality);
+                PlayerbotFactory factory(requester, requester->GetLevel(), quality, gs);
+                factory.InitEquipment(true);
                 ok = true;
                 reason = "APPLIED";
             }
@@ -10341,7 +10348,7 @@ void RunSelfActionCommand(
             {
                 PlayerbotFactory factory(requester, requester->GetLevel());
 
-                if (!botAI->IsAltBot())
+                if (!botAI->IsAlt())
                 {
                     factory.InitAttunementQuests();
                     factory.InitBags(false);
