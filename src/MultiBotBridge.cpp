@@ -62,6 +62,7 @@ namespace
 {
 char const* const kAddonPrefix = "MBOT";
 char const* const kAddonEnvelope = "MBOT\t";
+std::string gCurrentReplyPrefix = kAddonPrefix;
 char const* const kBridgeName = "mod-multibot-bridge";
 char const* const kProtocolVersion = "1";
 char const kFieldSeparator = '~';
@@ -241,17 +242,73 @@ bool BridgeConsoleLogsEnabled()
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
 }
 
+std::string Trim(std::string const& value);
+std::string ToUpper(std::string value);
+std::string UrlEncodeField(std::string const& value);
+
+bool SameName(std::string const& left, std::string const& right)
+{
+    return ToUpper(Trim(left)) == ToUpper(Trim(right));
+}
+
+std::vector<std::string> GetAcceptedAddonPrefixes()
+{
+    std::string const configured = sConfigMgr->GetOption<std::string>("MultiBotBridge.AcceptPrefixes", kAddonPrefix);
+    std::vector<std::string> prefixes;
+    std::size_t start = 0;
+    while (start <= configured.size())
+    {
+        std::size_t const end = configured.find(',', start);
+        std::string prefix = Trim(configured.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (!prefix.empty() && std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end())
+            prefixes.push_back(prefix);
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+
+    if (prefixes.empty())
+        prefixes.emplace_back(kAddonPrefix);
+    return prefixes;
+}
+
+bool IsAcceptedAddonPrefix(std::string const& prefix)
+{
+    std::vector<std::string> const prefixes = GetAcceptedAddonPrefixes();
+    return std::find(prefixes.begin(), prefixes.end(), prefix) != prefixes.end();
+}
+
+class ReplyPrefixScope final
+{
+public:
+    explicit ReplyPrefixScope(std::string prefix) : previous_(gCurrentReplyPrefix)
+    {
+        gCurrentReplyPrefix = std::move(prefix);
+    }
+
+    ~ReplyPrefixScope()
+    {
+        gCurrentReplyPrefix = std::move(previous_);
+    }
+
+private:
+    std::string previous_;
+};
+
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 bool ConsumeSelfBotRequestRateLimit(Player* requester);
 bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
+void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken);
+void SendBotSkillsBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken);
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason);
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
+void RunBagMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 sourceBagIndex, uint8 targetBagIndex);
 void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void RunInventoryItemDepositExactCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
 void RunLootRuleItemCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& actionValue, uint32 itemId);
@@ -263,9 +320,21 @@ void RunProfessionRecipeTargetCommand(Player* requester, ChatMsg replyType, std:
 void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName);
+void SendNativeActionResult(Player* requester, ChatMsg replyType, char const* opcode, std::string const& botName, std::string const& token, bool ok, std::string const& reason, std::string const& extra = "")
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName) << kFieldSeparator << token << kFieldSeparator
+        << (ok ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason);
+    if (!extra.empty()) payload << kFieldSeparator << UrlEncodeField(extra);
+    SendAddonPacket(requester, replyType, opcode, payload.str());
+}
+
 void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
 void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 slot, uint32 specIndex);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
+void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId, std::string const& targetName);
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
@@ -558,18 +627,27 @@ std::string SanitizeLogValue(std::string const& value, std::size_t maxLength)
     return out;
 }
 
-BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& payload, std::string& reason)
+BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& prefix, std::string& payload, std::string& reason)
 {
+    prefix.clear();
     payload.clear();
     reason.clear();
 
     if (lang != LANG_ADDON)
         return BridgePayloadStatus::NotBridge;
 
-    std::size_t const envelopeLength = std::char_traits<char>::length(kAddonEnvelope);
-    if (msg.size() < envelopeLength || msg.compare(0, envelopeLength, kAddonEnvelope) != 0)
+    std::size_t const separator = msg.find('\t');
+    if (separator == std::string::npos || separator == 0)
         return BridgePayloadStatus::NotBridge;
 
+    prefix = msg.substr(0, separator);
+    if (!IsAcceptedAddonPrefix(prefix))
+    {
+        prefix.clear();
+        return BridgePayloadStatus::NotBridge;
+    }
+
+    std::size_t const envelopeLength = separator + 1;
     if (msg.size() > kMaxBridgeWireLength)
     {
         reason = "WIRE_TOO_LONG";
@@ -3953,6 +4031,23 @@ void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::strin
         bot->GetMaxKeyringSize(),
         0);
 
+    // GetInventoryItems() only covers carried items, so emit current equipment separately.
+    for (uint8 equipSlot = EQUIPMENT_SLOT_START; equipSlot < EQUIPMENT_SLOT_END; ++equipSlot)
+    {
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+        if (!item || !item->GetTemplate())
+            continue;
+
+        std::ostringstream payload;
+        payload << bot->GetName()
+                << kFieldSeparator << requestToken
+                << kFieldSeparator << static_cast<uint32>(equipSlot)
+                << kFieldSeparator << item->GetTemplate()->ItemId
+                << kFieldSeparator << item->GetCount()
+                << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+        SendAddonPacket(requester, replyType, "INV_EQUIP_LOC", payload.str());
+    }
+
     std::vector<Item*> const items = botAI->GetInventoryItems();
     for (Item* const item : items)
     {
@@ -5233,6 +5328,305 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
     return true;
 }
 
+struct BulkBagData
+{
+    uint8 index = 0;
+    uint32 itemId = 0;
+    std::string link;
+    uint32 slots = 0;
+    std::string type;
+};
+
+std::string GetBulkBagType(ItemTemplate const* proto)
+{
+    if (!proto)
+        return "BACKPACK";
+    if (proto->BagFamily & BAG_FAMILY_MASK_ARROWS)
+        return "QUIVER";
+    if (proto->BagFamily & BAG_FAMILY_MASK_BULLETS)
+        return "AMMO_POUCH";
+    if (proto->BagFamily & BAG_FAMILY_MASK_SOUL_SHARDS)
+        return "SOUL_SHARD";
+    if (proto->Class == ITEM_CLASS_CONTAINER && proto->SubClass == ITEM_SUBCLASS_CONTAINER)
+        return "NORMAL";
+    return "UNKNOWN";
+}
+
+std::vector<BulkBagData> BuildBulkBags(Player* bot)
+{
+    std::vector<BulkBagData> bags(1);
+    bags[0].type = "BACKPACK";
+    bags[0].slots = 16;
+    if (!bot)
+        return bags;
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* const container = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+        if (!container)
+            continue;
+        ItemTemplate const* const proto = container->GetTemplate();
+        BulkBagData entry;
+        entry.index = static_cast<uint8>(bag - INVENTORY_SLOT_BAG_START + 1);
+        entry.itemId = proto ? proto->ItemId : 0;
+        entry.link = proto ? ChatHelper::FormatItem(proto, 1) : "";
+        entry.slots = container->GetBagSize();
+        entry.type = GetBulkBagType(proto);
+        bags.push_back(entry);
+    }
+    return bags;
+}
+
+Player* FindAllowedPlayerTarget(Player* requester, std::string const& encodedTargetName)
+{
+    std::string const targetName = Trim(UrlDecodeField(encodedTargetName));
+    if (targetName.empty())
+        return nullptr;
+    if (requester && SameName(requester->GetName(), targetName))
+        return requester;
+    if (requester)
+        if (Player* const bot = FindBotByName(requester, targetName))
+            return bot;
+    std::string normalizedName = targetName;
+    if (!normalizePlayerName(normalizedName))
+        return nullptr;
+    Player* const target = ObjectAccessor::FindPlayerByName(normalizedName, false);
+    if (target && requester && requester->GetGroup() && target->GetGroup() == requester->GetGroup())
+        return target;
+    return nullptr;
+}
+
+Unit* ResolveSpellTarget(Player* requester, Player* bot, PlayerbotAI* botAI, std::string const& encodedTargetName)
+{
+    std::string const targetName = Trim(UrlDecodeField(encodedTargetName));
+    if (!bot)
+        return nullptr;
+
+    if (targetName.empty())
+    {
+        if (Unit* const selected = bot->GetSelectedUnit())
+            return selected;
+
+        return bot;
+    }
+
+    if (Player* const targetPlayer = FindAllowedPlayerTarget(requester, targetName))
+        return targetPlayer;
+
+    if (!botAI || !botAI->GetAiObjectContext())
+        return nullptr;
+
+    static char const* const valueNames[] = { "possible targets", "all targets", "nearest npcs" };
+    for (char const* const valueName : valueNames)
+    {
+        GuidVector const units = *botAI->GetAiObjectContext()->GetValue<GuidVector>(valueName);
+        for (ObjectGuid const guid : units)
+        {
+            Unit* const unit = botAI->GetUnit(guid);
+            if (unit && SameName(unit->GetName(), targetName))
+                return unit;
+        }
+    }
+
+    return nullptr;
+}
+
+std::string GetBridgeSpellFailureReason(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_CAST_OK:
+        case SPELL_FAILED_SUCCESS:
+            return "OK";
+        case SPELL_FAILED_NOT_KNOWN:
+            return "MISSING_SPELL";
+        case SPELL_FAILED_BAD_TARGETS:
+        case SPELL_FAILED_BAD_IMPLICIT_TARGETS:
+        case SPELL_FAILED_NO_VALID_TARGETS:
+            return "INVALID_TARGET";
+        case SPELL_FAILED_OUT_OF_RANGE:
+        case SPELL_FAILED_TOO_CLOSE:
+            return "OUT_OF_RANGE";
+        case SPELL_FAILED_NO_POWER:
+            return "NO_MANA";
+        case SPELL_FAILED_NOT_READY:
+        case SPELL_FAILED_ITEM_NOT_READY:
+            return "COOLDOWN";
+        case SPELL_FAILED_REAGENTS:
+            return "REAGENTS";
+        case SPELL_FAILED_NEED_MORE_ITEMS:
+            return "NO_MATERIALS";
+        case SPELL_FAILED_MOVING:
+            return "MOVING";
+        case SPELL_FAILED_NOT_IN_CONTROL:
+        case SPELL_FAILED_STUNNED:
+        case SPELL_FAILED_CONFUSED:
+        case SPELL_FAILED_FLEEING:
+            return "LOST_CONTROL";
+        case SPELL_FAILED_TRY_AGAIN:
+        case SPELL_FAILED_SPELL_IN_PROGRESS:
+            return "TRY_AGAIN";
+        case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+            return "REQUIRES_SPELL_FOCUS";
+        case SPELL_FAILED_EQUIPPED_ITEM:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_MAINHAND:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_OFFHAND:
+        case SPELL_FAILED_TOTEM_CATEGORY:
+        case SPELL_FAILED_TOTEMS:
+            return "MISSING_TOOLS";
+        default:
+            return "CAST_FAILED";
+    }
+}
+
+struct BridgeSpellCheckData
+{
+    bool ok = false;
+    std::string reason = "CAST_FAILED";
+    SpellCastResult result = SPELL_FAILED_ERROR;
+};
+
+void BuildBridgeSpellTargets(Player* bot, SpellInfo const* spellInfo, Unit* target, Item* itemTarget, SpellCastTargets& targets)
+{
+    if (!target)
+        target = bot;
+
+    if (spellInfo->Effects[0].Effect != SPELL_EFFECT_OPEN_LOCK &&
+        (spellInfo->Targets & TARGET_FLAG_ITEM || spellInfo->Targets & TARGET_FLAG_GAMEOBJECT_ITEM))
+    {
+        // EN: Trade enchant/enhancement spells target the other player's not-traded slot.
+        // FR: Les enchantements/améliorations en échange ciblent l'emplacement non échangé de l'autre joueur.
+        if (itemTarget && bot->GetTrader())
+            targets.SetTradeItemTarget(bot);
+        else
+            targets.SetItemTarget(itemTarget);
+    }
+    else if (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
+        targets.SetDst(*target);
+    else if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+        targets.SetDst(*bot);
+    else
+        targets.SetUnitTarget(target);
+}
+
+SpellCastResult CastBridgeSpellDirect(Player* bot, SpellInfo const* spellInfo, Unit* target, Item* itemTarget = nullptr)
+{
+    if (!bot || !spellInfo)
+        return SPELL_FAILED_ERROR;
+
+    if (!target)
+        target = bot;
+
+    ObjectGuid const oldSelection = bot->GetSelectedUnit() ? bot->GetSelectedUnit()->GetGUID() : ObjectGuid();
+    bot->SetSelection(target->GetGUID());
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    BuildBridgeSpellTargets(bot, spellInfo, target, itemTarget, targets);
+    SpellCastResult const result = spell->prepare(&targets);
+
+    bot->SetSelection(oldSelection);
+
+    return result;
+}
+
+BridgeSpellCheckData CheckBridgeSpellCast(Player* bot, PlayerbotAI* botAI, uint32 spellId, Unit* target, Item* itemTarget = nullptr)
+{
+    BridgeSpellCheckData data;
+
+    if (!bot || !botAI || !spellId)
+    {
+        data.reason = "BAD_REQUEST";
+        return data;
+    }
+
+    if (!target)
+        target = bot;
+
+    if (!target->IsInWorld())
+    {
+        data.reason = "INVALID_TARGET";
+        return data;
+    }
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+    {
+        data.reason = "LOST_CONTROL";
+        return data;
+    }
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+    {
+        data.reason = "UNKNOWN_SPELL";
+        return data;
+    }
+
+    Pet* const pet = bot->GetPet();
+    if (!bot->HasSpell(spellId) && !(pet && pet->HasSpell(spellId)))
+    {
+        data.result = SPELL_FAILED_NOT_KNOWN;
+        data.reason = "MISSING_SPELL";
+        return data;
+    }
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+    {
+        data.reason = "TRY_AGAIN";
+        return data;
+    }
+
+    if (bot->HasSpellCooldown(spellId))
+    {
+        data.result = SPELL_FAILED_NOT_READY;
+        data.reason = "COOLDOWN";
+        return data;
+    }
+
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+    {
+        data.reason = "CAST_FAILED";
+        return data;
+    }
+
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        data.result = SPELL_FAILED_NOT_STANDING;
+        data.reason = "TRY_AGAIN";
+        return data;
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+    {
+        data.result = SPELL_FAILED_MOVING;
+        data.reason = "MOVING";
+        return data;
+    }
+
+    ObjectGuid const oldSelection = bot->GetSelectedUnit() ? bot->GetSelectedUnit()->GetGUID() : ObjectGuid();
+    bot->SetSelection(target->GetGUID());
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    BuildBridgeSpellTargets(bot, spellInfo, target, itemTarget, targets);
+
+    // EN: CheckCast reads Spell::m_targets; validate the same target set that CastSpell will prepare.
+    // FR: CheckCast lit Spell::m_targets; valider la même cible que CastSpell préparera.
+    spell->m_targets = targets;
+    data.result = spell->CheckCast(true);
+    delete spell;
+
+    bot->SetSelection(oldSelection);
+
+    data.reason = GetBridgeSpellFailureReason(data.result);
+    data.ok = data.reason == "OK";
+    return data;
+}
+
+
 uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!bot || !itemId)
@@ -6406,6 +6800,55 @@ bool ValidateTalentApplyBuild(
     return parsedPoints == requestedPoints;
 }
 
+void RunSpellCastCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue, std::string const& encodedTargetName)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 spellId = 0;
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    if (!bot)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "NO_BOT");
+        return;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "NO_AI");
+        return;
+    }
+
+    if (!TryParseUint32Field(spellIdValue, 1, std::numeric_limits<uint32>::max(), spellId))
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "BAD_REQUEST");
+        return;
+    }
+
+    Unit* const target = ResolveSpellTarget(requester, bot, botAI, encodedTargetName);
+    if (!target)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, "INVALID_TARGET");
+        return;
+    }
+
+    BridgeSpellCheckData const check = CheckBridgeSpellCast(bot, botAI, spellId, target);
+    if (!check.ok)
+    {
+        SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, false, check.reason, std::to_string(static_cast<uint32>(check.result)));
+        return;
+    }
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    SpellCastResult const result = CastBridgeSpellDirect(bot, spellInfo, target);
+    bool const ok = result == SPELL_CAST_OK;
+    SendNativeActionResult(requester, replyType, "CAST_SPELL", effectiveBotName, token, ok, ok ? "OK" : GetBridgeSpellFailureReason(result), ok ? "" : std::to_string(static_cast<uint32>(result)));
+}
+
+
 void RunTalentApplyCommand(
     Player* requester,
     ChatMsg replyType,
@@ -6771,6 +7214,72 @@ bool RegisterQuestAbandonToken(Player* requester, std::string const& token)
     return true;
 }
 
+void SendQuestShareResult(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& token, bool ok, std::string const& reason, uint32 accepted)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName) << kFieldSeparator << token << kFieldSeparator
+        << (ok ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << "BOT_ACCEPTS:" << accepted;
+    SendAddonPacket(requester, replyType, "QUEST_SHARE", payload.str());
+}
+
+void RunQuestShareCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId, std::string const& targetName)
+{
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, Trim(botName));
+    std::string const effectiveName = bot ? bot->GetName() : Trim(botName);
+    if (!bot || !bot->GetGroup())
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, bot ? "INVALID_TARGET" : "NO_BOT", 0);
+
+    Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest)
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, "INVALID_QUEST_ID", 0);
+
+    uint8 questSlot = MAX_QUEST_LOG_SIZE;
+    for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        if (bot->GetQuestSlotQuestId(slot) == questId)
+            questSlot = slot;
+    if (questSlot >= MAX_QUEST_LOG_SIZE || !bot->CanShareQuest(questId))
+        return SendQuestShareResult(requester, replyType, effectiveName, token, false, questSlot >= MAX_QUEST_LOG_SIZE ? "MISSING_QUEST" : "NOT_SHAREABLE", 0);
+
+    Player* target = nullptr;
+    std::string const decodedTarget = Trim(UrlDecodeField(targetName));
+    if (!decodedTarget.empty())
+    {
+        target = SameName(requester->GetName(), decodedTarget) ? requester : ObjectAccessor::FindPlayerByName(decodedTarget, false);
+        if (!target || target == bot || target->GetGroup() != bot->GetGroup() || !target->IsInMap(bot))
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "INVALID_TARGET", 0);
+        if (!target->SatisfyQuestStatus(quest, false) || target->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE)
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "TARGET_HAS_QUEST", 0);
+        if (!target->CanTakeQuest(quest, false) || !target->SatisfyQuestLog(false))
+            return SendQuestShareResult(requester, replyType, effectiveName, token, false, "NOT_SHAREABLE", 0);
+    }
+
+    WorldPacket packet(CMSG_PUSHQUESTTOPARTY);
+    packet << questId;
+    WorldPackets::Quest::PushQuestToParty pushQuest(std::move(packet));
+    pushQuest.Read();
+    bot->GetSession()->HandlePushQuestToParty(pushQuest);
+
+    uint32 accepted = 0;
+    for (GroupReference* itr = bot->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* const member = itr->GetSource();
+        if (!member || member == bot || !member->IsInWorld() || !member->IsInMap(bot) ||
+            (!decodedTarget.empty() && !SameName(member->GetName(), decodedTarget)))
+            continue;
+        PlayerbotAI* const ai = GET_PLAYERBOT_AI(member);
+        if (!ai || !member->SatisfyQuestStatus(quest, false) || member->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE ||
+            !member->CanTakeQuest(quest, false) || !member->SatisfyQuestLog(false) || member->GetDivider().IsEmpty())
+            continue;
+        WorldPacket accept(CMSG_PUSHQUESTTOPARTY, 20);
+        accept << questId;
+        ai->HandleMasterIncomingPacket(accept);
+        ++accepted;
+    }
+    SendQuestShareResult(requester, replyType, effectiveName, token, true, "OK", accepted);
+}
+
 void RunQuestAbandonCommand(
     Player* requester,
     ChatMsg replyType,
@@ -7015,6 +7524,62 @@ void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const
         << kFieldSeparator << UrlEncodeField(reason);
 
     SendAddonPacket(requester, replyType, "GROUP_ROLL_ACK", payload.str());
+}
+
+void RunBagMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 sourceBagIndex, uint8 targetBagIndex)
+{
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, Trim(botName));
+    std::string const effectiveName = bot ? bot->GetName() : Trim(botName);
+    std::string reason = "OK";
+    bool changed = false;
+
+    if (!ConsumeInventoryItemMoveRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!RegisterInventoryItemMoveToken(requester, token))
+            reason = "DUPLICATE";
+        else if (!bot->GetSession() || !bot->IsInWorld())
+            reason = "BOT_UNAVAILABLE";
+        else if (sourceBagIndex < 1 || sourceBagIndex > 4 || targetBagIndex < 1 || targetBagIndex > 4)
+            reason = "BAD_POSITION";
+        else if (sourceBagIndex == targetBagIndex)
+            reason = "SAME_POSITION";
+        else
+        {
+            uint8 const sourceSlot = static_cast<uint8>(INVENTORY_SLOT_BAG_START + sourceBagIndex - 1);
+            uint8 const targetSlot = static_cast<uint8>(INVENTORY_SLOT_BAG_START + targetBagIndex - 1);
+            Item* const source = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, sourceSlot);
+            Item* const destination = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, targetSlot);
+            if (!source || !source->IsBag())
+                reason = "MISSING_ITEM";
+            else if (destination)
+                reason = "TARGET_NOT_EMPTY";
+            else
+            {
+                bot->SwapItem((static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | sourceSlot,
+                    (static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | targetSlot);
+                changed = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, targetSlot) == source &&
+                    bot->GetItemByPos(INVENTORY_SLOT_BAG_0, sourceSlot) == nullptr;
+                if (!changed)
+                    reason = "POSTCONDITION_FAILED";
+            }
+        }
+    }
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveName) << kFieldSeparator << token << kFieldSeparator
+        << (changed ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << static_cast<uint32>(sourceBagIndex)
+        << kFieldSeparator << static_cast<uint32>(targetBagIndex);
+    SendAddonPacket(requester, replyType, "BAG_MOVE", payload.str());
 }
 
 void RunInventoryItemMoveCommand(
@@ -10933,7 +11498,8 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
     if (!player || !player->GetSession())
         return;
 
-    std::string wire = std::string(kAddonEnvelope) + opcode;
+    std::string const replyPrefix = IsAcceptedAddonPrefix(gCurrentReplyPrefix) ? gCurrentReplyPrefix : std::string(kAddonPrefix);
+    std::string wire = replyPrefix + "\t" + opcode;
     if (!payload.empty())
         wire += std::string(1, kFieldSeparator) + payload;
 
@@ -12345,6 +12911,78 @@ std::string BuildStatsPayload(Player* player, std::string const& botName)
     return BuildStatsPayload(bot);
 }
 
+void SendInventoryBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    SendAddonPacket(requester, replyType, "INV_BULK_BEGIN", token);
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        for (BulkBagData const& bag : BuildBulkBags(bot))
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                << kFieldSeparator << static_cast<uint32>(bag.index)
+                << kFieldSeparator << bag.itemId << kFieldSeparator << UrlEncodeField(bag.link)
+                << kFieldSeparator << bag.slots << kFieldSeparator << UrlEncodeField(bag.type);
+            SendAddonPacket(requester, replyType, "INV_BAG", payload.str());
+        }
+
+        PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (botAI)
+        {
+            for (Item* const item : botAI->GetInventoryItems())
+            {
+                if (!item || !item->GetTemplate())
+                    continue;
+                ItemTemplate const* const proto = item->GetTemplate();
+                std::string text = ChatHelper::FormatItem(proto, item->GetCount());
+                if (item->IsSoulBound())
+                    text += " (soulbound)";
+                std::ostringstream payload;
+                payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                    << kFieldSeparator << static_cast<uint32>(item->GetBagSlot())
+                    << kFieldSeparator << static_cast<uint32>(item->GetSlot())
+                    << kFieldSeparator << proto->ItemId << kFieldSeparator << item->GetCount()
+                    << kFieldSeparator << UrlEncodeField(text)
+                    << kFieldSeparator << (item->IsSoulBound() ? 1 : 0);
+                SendAddonPacket(requester, replyType, "INV_ITEM_LOC", payload.str());
+            }
+        }
+
+        InventorySummaryData const summary = BuildInventorySummary(bot);
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+            << kFieldSeparator << summary.gold << kFieldSeparator << summary.silver
+            << kFieldSeparator << summary.copper << kFieldSeparator << summary.bagUsed
+            << kFieldSeparator << summary.bagTotal;
+        SendAddonPacket(requester, replyType, "INV_BULK_ITEM", payload.str());
+    }
+
+    SendAddonPacket(requester, replyType, "INV_BULK_END", token);
+}
+
+void SendBotSkillsBulkPackets(Player* requester, ChatMsg replyType, std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_BEGIN", token);
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        for (BotSkillEntryData const& entry : BuildBotSkillEntries(bot))
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(bot->GetName()) << kFieldSeparator << token
+                << kFieldSeparator << entry.skillId << kFieldSeparator << UrlEncodeField(entry.category)
+                << kFieldSeparator << UrlEncodeField(entry.key) << kFieldSeparator << UrlEncodeField(entry.name)
+                << kFieldSeparator << entry.value << kFieldSeparator << entry.maxValue;
+            SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_ITEM", payload.str());
+        }
+    }
+
+    SendAddonPacket(requester, replyType, "BOT_SKILLS_BULK_END", token);
+}
+
 void SendStatsPackets(Player* player, ChatMsg replyType)
 {
     for (Player* const bot : GetBridgeVisibleBots(player))
@@ -12999,6 +13637,28 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "INVENTORY_BULK")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+            SendInventoryBulkPackets(player, replyType, fields[1]);
+            return true;
+        }
+
+        if (requestType == "BOT_SKILLS_BULK")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            if (fields.size() != 2)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+            SendBotSkillsBulkPackets(player, replyType, fields[1]);
+            return true;
+        }
+
         if (requestType == "PROFESSION_RECIPES")
         {
             std::string const token = GetSafeErrorToken(fields, 3);
@@ -13315,6 +13975,34 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "CAST_SPELL")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 spellId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), spellId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        RunSpellCastCommand(player, replyType, fields[1], fields[2], fields[3], fields[4]);
+        return true;
+    }
+
+    if (requestType == "QUEST_SHARE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+        RunQuestShareCommand(player, replyType, fields[1], fields[2], questId, fields[4]);
+        return true;
+    }
+
     if (requestType == "QUEST_ABANDON")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
@@ -13539,6 +14227,21 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunInventoryItemSellCommand(
             player, replyType, fields[1], fields[2],
             static_cast<uint8>(srcBag), static_cast<uint8>(srcSlot), srcItemId, srcCount);
+        return true;
+    }
+
+    if (requestType == "BAG_MOVE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 5)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false) || !IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_REQUEST");
+        uint32 source = 0;
+        uint32 target = 0;
+        if (!TryParseUint32Field(fields[3], 1, 4, source) || !TryParseUint32Field(fields[4], 1, 4, target))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_POSITION");
+        RunBagMoveCommand(player, replyType, fields[1], fields[2], static_cast<uint8>(source), static_cast<uint8>(target));
         return true;
     }
 
@@ -13826,13 +14529,15 @@ public:
         if (!player)
             return false;
 
+        std::string prefix;
         std::string payload;
         std::string reason;
-        BridgePayloadStatus const status = TryExtractBridgePayload(lang, msg, payload, reason);
+        BridgePayloadStatus const status = TryExtractBridgePayload(lang, msg, prefix, payload, reason);
         if (status == BridgePayloadStatus::NotBridge)
             return false;
 
         ChatMsg const replyType = NormalizeReplyChatType(type);
+        ReplyPrefixScope const replyPrefixScope(prefix);
         if (status == BridgePayloadStatus::Invalid)
         {
             if (BridgeConsoleLogsEnabled())
