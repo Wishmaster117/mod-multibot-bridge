@@ -1,5 +1,6 @@
 #include "Bag.h"
 #include "Chat.h"
+#include "CharacterCache.h"
 #include "Config.h"
 #include "Creature.h"
 #include "DatabaseEnv.h"
@@ -13,6 +14,8 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
+#include "ObjectAccessor.h"
+#include "ObjectGuid.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "QuestPackets.h"
@@ -160,6 +163,19 @@ std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
 std::chrono::milliseconds constexpr kSelfBotRateWindow(2000);
 std::size_t constexpr kSelfBotMaxRequesterStates = 512;
+std::size_t constexpr kAltRosterRateLimit = 4;
+std::chrono::milliseconds constexpr kAltRosterRateWindow(2000);
+std::size_t constexpr kAltRosterMaxRequesterStates = 512;
+std::size_t constexpr kMaxAltRosterEntries = 128;
+std::size_t constexpr kBotLifecycleQueryRateLimit = 256;
+std::size_t constexpr kBotLifecycleMutationRateLimit = 64;
+std::chrono::milliseconds constexpr kBotLifecycleRateWindow(2000);
+std::chrono::seconds constexpr kBotLifecycleReplayTtl(10);
+std::chrono::seconds constexpr kBotLifecycleConnectTimeout(10);
+std::chrono::seconds constexpr kBotLifecyclePendingRetention(60);
+std::size_t constexpr kBotLifecycleMaxRecentTokens = 320;
+std::size_t constexpr kBotLifecycleMaxRequesterStates = 512;
+std::size_t constexpr kBotLifecycleMaxPendingConnects = 64;
 std::chrono::seconds constexpr kSelfBotHeavyActionRateWindow(10);
 std::size_t constexpr kSelfBotHeavyActionMaxRequesterStates = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
@@ -201,6 +217,9 @@ char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 char const* const kSelfBotCapability = "SELF_BOT_V1";
 char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
 char const* const kSelfActionCapability = "SELF_ACTION_V1";
+char const* const kAltRosterCapability = "ALT_ROSTER_V1";
+char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
+char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemTradeCount = 1000;
@@ -388,7 +407,10 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kEnchantTradeCapability,
         kSelfBotCapability,
         kSelfStrategyCapability,
-        kSelfActionCapability
+        kSelfActionCapability,
+        kAltRosterCapability,
+        kBotLifecycleCapability,
+        kBotTargetResolveCapability
     };
 
     std::vector<std::string> chunks;
@@ -11734,6 +11756,815 @@ std::string JoinStrategies(std::vector<std::string> const& strategies)
     return out.str();
 }
 
+// MB_ALT_ROSTER_DISCOVERY_V1_BEGIN
+using AltRosterRateClock = std::chrono::steady_clock;
+std::map<uint32, std::deque<AltRosterRateClock::time_point>> gAltRosterRequestRateStates;
+
+bool ConsumeAltRosterRequestRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    AltRosterRateClock::time_point const now = AltRosterRateClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto pruneQueue = [now](std::deque<AltRosterRateClock::time_point>& attempts)
+    {
+        while (!attempts.empty() && now - attempts.front() >= kAltRosterRateWindow)
+            attempts.pop_front();
+    };
+
+    auto it = gAltRosterRequestRateStates.find(requesterKey);
+    if (it == gAltRosterRequestRateStates.end())
+    {
+        for (auto existing = gAltRosterRequestRateStates.begin(); existing != gAltRosterRequestRateStates.end();)
+        {
+            pruneQueue(existing->second);
+            if (existing->second.empty())
+                existing = gAltRosterRequestRateStates.erase(existing);
+            else
+                ++existing;
+        }
+
+        if (gAltRosterRequestRateStates.size() >= kAltRosterMaxRequesterStates)
+            return false;
+
+        it = gAltRosterRequestRateStates.emplace(
+            requesterKey, std::deque<AltRosterRateClock::time_point>()).first;
+    }
+
+    std::deque<AltRosterRateClock::time_point>& attempts = it->second;
+    pruneQueue(attempts);
+    if (attempts.size() >= kAltRosterRateLimit)
+        return false;
+
+    attempts.push_back(now);
+    return true;
+}
+
+void SendAltRosterPackets(Player* requester, ChatMsg replyType)
+{
+    if (!requester || !requester->GetSession())
+        return;
+
+    uint32 const accountId = requester->GetSession()->GetAccountId();
+    uint32 const requesterGuid = requester->GetGUID().GetCounter();
+
+    // MB_ALT_ROSTER_ONLINE_STATE_V1_BEGIN
+    PlayerbotMgr* const playerbotMgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    // MB_ALT_ROSTER_ONLINE_STATE_V1_END
+
+    std::vector<std::string> entries;
+    bool truncated = false;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT guid, name, class, level FROM characters "
+        "WHERE account = {} AND deleteInfos_Name IS NULL ORDER BY guid",
+        accountId);
+
+    if (result)
+    {
+        do
+        {
+            Field* const fields = result->Fetch();
+            uint32 const guid = fields[0].Get<uint32>();
+            if (guid == requesterGuid)
+                continue;
+
+            if (entries.size() >= kMaxAltRosterEntries)
+            {
+                truncated = true;
+                break;
+            }
+
+            std::string const name = fields[1].Get<std::string>();
+            uint32 const classId = fields[2].Get<uint8>();
+            uint32 const level = fields[3].Get<uint8>();
+            bool const online = playerbotMgr && playerbotMgr->GetPlayerBot(guid) != nullptr;
+
+            std::ostringstream entry;
+            entry << guid
+                << kFieldSeparator << UrlEncodeField(name)
+                << kFieldSeparator << classId
+                << kFieldSeparator << level
+                << kFieldSeparator << (online ? "ONLINE" : "OFFLINE");
+
+            std::string const payload = entry.str();
+            if (!IsAddonPacketWithinBudget("ALT_ROSTER_ENTRY", payload))
+            {
+                truncated = true;
+                continue;
+            }
+
+            entries.push_back(payload);
+        }
+        while (result->NextRow());
+    }
+
+    std::ostringstream framing;
+    framing << entries.size() << kFieldSeparator << (truncated ? '1' : '0');
+
+    SendAddonPacket(requester, replyType, "ALT_ROSTER_BEGIN", framing.str());
+    for (std::string const& entry : entries)
+        SendAddonPacket(requester, replyType, "ALT_ROSTER_ENTRY", entry);
+    SendAddonPacket(requester, replyType, "ALT_ROSTER_END", framing.str());
+}
+// MB_ALT_ROSTER_DISCOVERY_V1_END
+
+// MB_BOT_LIFECYCLE_V1_BEGIN
+using BotLifecycleClock = std::chrono::steady_clock;
+
+struct BotLifecyclePendingConnect
+{
+    BotLifecycleClock::time_point startedAt;
+};
+
+struct BotLifecycleRequesterState
+{
+    std::deque<BotLifecycleClock::time_point> requests;
+    std::deque<std::pair<std::string, BotLifecycleClock::time_point>> recentTokens;
+    std::map<uint32, BotLifecyclePendingConnect> pendingConnects;
+};
+
+std::map<uint32, BotLifecycleRequesterState> gBotLifecycleRequesterStates;
+
+void PruneBotLifecycleRequesterState(
+    BotLifecycleRequesterState& state,
+    BotLifecycleClock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kBotLifecycleRateWindow)
+        state.requests.pop_front();
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kBotLifecycleReplayTtl)
+        state.recentTokens.pop_front();
+
+    while (state.recentTokens.size() > kBotLifecycleMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    for (auto it = state.pendingConnects.begin(); it != state.pendingConnects.end();)
+    {
+        if (now - it->second.startedAt >= kBotLifecyclePendingRetention)
+            it = state.pendingConnects.erase(it);
+        else
+            ++it;
+    }
+}
+
+BotLifecycleRequesterState* GetBotLifecycleRequesterState(
+    Player* requester,
+    bool create,
+    BotLifecycleClock::time_point const now)
+{
+    if (!requester)
+        return nullptr;
+
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+    auto it = gBotLifecycleRequesterStates.find(requesterKey);
+    if (it != gBotLifecycleRequesterStates.end())
+    {
+        PruneBotLifecycleRequesterState(it->second, now);
+        return &it->second;
+    }
+
+    if (!create)
+        return nullptr;
+
+    if (gBotLifecycleRequesterStates.size() >= kBotLifecycleMaxRequesterStates)
+    {
+        for (auto existing = gBotLifecycleRequesterStates.begin();
+             existing != gBotLifecycleRequesterStates.end();)
+        {
+            PruneBotLifecycleRequesterState(existing->second, now);
+            if (existing->second.requests.empty()
+                && existing->second.recentTokens.empty()
+                && existing->second.pendingConnects.empty())
+            {
+                existing = gBotLifecycleRequesterStates.erase(existing);
+            }
+            else
+                ++existing;
+        }
+    }
+
+    if (gBotLifecycleRequesterStates.size() >= kBotLifecycleMaxRequesterStates)
+        return nullptr;
+
+    it = gBotLifecycleRequesterStates.emplace(
+        requesterKey, BotLifecycleRequesterState()).first;
+    return &it->second;
+}
+
+std::map<uint32, std::deque<BotLifecycleClock::time_point>>
+    gBotLifecycleQueryRequests;
+
+bool ConsumeBotLifecycleQueryRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto it = gBotLifecycleQueryRequests.find(requesterKey);
+    if (it == gBotLifecycleQueryRequests.end())
+    {
+        if (gBotLifecycleQueryRequests.size() >= kBotLifecycleMaxRequesterStates)
+        {
+            for (auto existing = gBotLifecycleQueryRequests.begin();
+                 existing != gBotLifecycleQueryRequests.end();)
+            {
+                while (!existing->second.empty()
+                    && now - existing->second.front() >= kBotLifecycleRateWindow)
+                {
+                    existing->second.pop_front();
+                }
+
+                if (existing->second.empty())
+                    existing = gBotLifecycleQueryRequests.erase(existing);
+                else
+                    ++existing;
+            }
+        }
+
+        if (gBotLifecycleQueryRequests.size() >= kBotLifecycleMaxRequesterStates)
+            return false;
+
+        it = gBotLifecycleQueryRequests.emplace(
+            requesterKey,
+            std::deque<BotLifecycleClock::time_point>()).first;
+    }
+
+    std::deque<BotLifecycleClock::time_point>& requests = it->second;
+    while (!requests.empty()
+        && now - requests.front() >= kBotLifecycleRateWindow)
+    {
+        requests.pop_front();
+    }
+
+    if (requests.size() >= kBotLifecycleQueryRateLimit)
+        return false;
+
+    requests.push_back(now);
+    return true;
+}
+
+bool ConsumeBotLifecycleMutationRateLimit(Player* requester)
+{
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, true, now);
+    if (!state)
+        return false;
+
+    if (state->requests.size() >= kBotLifecycleMutationRateLimit)
+        return false;
+
+    state->requests.push_back(now);
+    return true;
+}
+
+bool RegisterBotLifecycleMutationToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, true, now);
+    if (!state)
+        return false;
+
+    for (auto const& recent : state->recentTokens)
+        if (recent.first == token)
+            return false;
+
+    state->recentTokens.push_back({token, now});
+    while (state->recentTokens.size() > kBotLifecycleMaxRecentTokens)
+        state->recentTokens.pop_front();
+    return true;
+}
+
+bool ResolveBotLifecycleTarget(
+    Player* requester,
+    uint32 lowGuid,
+    ObjectGuid& targetGuid,
+    CharacterCacheEntry const*& target,
+    std::string& reason)
+{
+    target = nullptr;
+    reason.clear();
+
+    if (!requester || !requester->GetSession())
+    {
+        reason = "NO_SESSION";
+        return false;
+    }
+
+    targetGuid = ObjectGuid::Create<HighGuid::Player>(lowGuid);
+    if (targetGuid == requester->GetGUID())
+    {
+        reason = "SELF_TARGET";
+        return false;
+    }
+
+    target = sCharacterCache->GetCharacterCacheByGuid(targetGuid);
+    if (!target)
+    {
+        reason = "NOT_FOUND";
+        return false;
+    }
+
+    return true;
+}
+
+bool IsBotLifecycleControlRelationAllowed(
+    Player* requester,
+    PlayerbotMgr* mgr,
+    ObjectGuid const& targetGuid,
+    CharacterCacheEntry const& target)
+{
+    if (!requester || !requester->GetSession() || !mgr)
+        return false;
+
+    uint32 const masterAccountId = requester->GetSession()->GetAccountId();
+    bool const sameAccount =
+        sPlayerbotAIConfig.allowAccountBots
+        && target.AccountId == masterAccountId;
+
+    Guild* const guild = requester->GetGuildId()
+        ? sGuildMgr->GetGuildById(requester->GetGuildId())
+        : nullptr;
+    bool const sameGuild =
+        sPlayerbotAIConfig.allowGuildBots
+        && guild
+        && guild->GetMember(targetGuid);
+
+    bool const addClassBot =
+        sRandomPlayerbotMgr.IsAddclassBot(targetGuid.GetCounter());
+
+    bool const linkedAccount =
+        sPlayerbotAIConfig.allowTrustedAccountBots
+        && mgr->IsAccountLinked(target.AccountId, masterAccountId);
+
+    // MB_BOT_LIFECYCLE_GROUP_AUTHORIZATION_B1_V1_BEGIN
+    return sameAccount || sameGuild || addClassBot || linkedAccount;
+    // MB_BOT_LIFECYCLE_GROUP_AUTHORIZATION_B1_V1_END
+}
+
+bool GetBotLifecyclePendingConnect(
+    Player* requester,
+    uint32 lowGuid,
+    bool& timedOut)
+{
+    timedOut = false;
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, false, now);
+    if (!state)
+        return false;
+
+    auto const it = state->pendingConnects.find(lowGuid);
+    if (it == state->pendingConnects.end())
+        return false;
+
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    timedOut =
+        now - it->second.startedAt >= kBotLifecycleConnectTimeout;
+
+    return true;
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
+}
+
+void ClearBotLifecyclePendingConnect(Player* requester, uint32 lowGuid)
+{
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, false, now);
+    if (state)
+        state->pendingConnects.erase(lowGuid);
+}
+
+bool StartBotLifecyclePendingConnect(Player* requester, uint32 lowGuid)
+{
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, true, now);
+    if (!state)
+        return false;
+
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    // GetBotLifecycleRequesterState() already prunes entries only after the
+    // longer kBotLifecyclePendingRetention window. Timed-out reporting must
+    // not release an asynchronous AddPlayerBot operation still in flight.
+    if (state->pendingConnects.size() >= kBotLifecycleMaxPendingConnects)
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
+        return false;
+
+    state->pendingConnects[lowGuid] = {now};
+    return true;
+}
+
+std::size_t CountBotLifecyclePendingConnects(Player* requester)
+{
+    BotLifecycleClock::time_point const now = BotLifecycleClock::now();
+    BotLifecycleRequesterState* const state =
+        GetBotLifecycleRequesterState(requester, false, now);
+    if (!state)
+        return 0;
+
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_BEGIN
+    // Timed-out-but-retained connects still reserve bot capacity until
+    // completion is observed or kBotLifecyclePendingRetention expires.
+    return state->pendingConnects.size();
+    // MB_BOT_LIFECYCLE_INFLIGHT_RETENTION_B2_V1_END
+}
+
+void SendBotLifecycleResultPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    uint32 lowGuid,
+    std::string const& name,
+    std::string const& action,
+    std::string const& status,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << lowGuid
+        << kFieldSeparator << UrlEncodeField(name)
+        << kFieldSeparator << action
+        << kFieldSeparator << status
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(requester, replyType, "BOT_LIFECYCLE", out.str());
+}
+
+void SendBotLifecycleStatePacket(
+    Player* requester,
+    ChatMsg replyType,
+    uint32 lowGuid,
+    std::string const& requestToken)
+{
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+    std::string resolveReason;
+    if (!ResolveBotLifecycleTarget(
+            requester, lowGuid, targetGuid, target, resolveReason))
+    {
+        std::ostringstream out;
+        out << requestToken
+            << kFieldSeparator << lowGuid
+            << kFieldSeparator
+            << kFieldSeparator << "OFFLINE"
+            << kFieldSeparator << resolveReason;
+        SendAddonPacket(
+            requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        std::ostringstream out;
+        out << requestToken
+            << kFieldSeparator << lowGuid
+            << kFieldSeparator << UrlEncodeField(target->Name)
+            << kFieldSeparator << "OFFLINE"
+            << kFieldSeparator << "NO_MANAGER";
+        SendAddonPacket(
+            requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+        return;
+    }
+
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        ClearBotLifecyclePendingConnect(requester, lowGuid);
+
+        std::ostringstream out;
+        out << requestToken
+            << kFieldSeparator << lowGuid
+            << kFieldSeparator << UrlEncodeField(target->Name)
+            << kFieldSeparator << "ONLINE"
+            << kFieldSeparator << "OK";
+        SendAddonPacket(
+            requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+        return;
+    }
+
+    if (!IsBotLifecycleControlRelationAllowed(
+            requester, mgr, targetGuid, *target))
+    {
+        std::ostringstream out;
+        out << requestToken
+            << kFieldSeparator << lowGuid
+            << kFieldSeparator
+            << kFieldSeparator << "OFFLINE"
+            << kFieldSeparator << "FORBIDDEN";
+        SendAddonPacket(
+            requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+        return;
+    }
+
+    bool timedOut = false;
+    if (GetBotLifecyclePendingConnect(requester, lowGuid, timedOut))
+    {
+        std::ostringstream out;
+        out << requestToken
+            << kFieldSeparator << lowGuid
+            << kFieldSeparator << UrlEncodeField(target->Name)
+            << kFieldSeparator << "CONNECTING"
+            << kFieldSeparator << "PENDING";
+        SendAddonPacket(
+            requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+        return;
+    }
+
+    std::string reason = timedOut ? "TIMEOUT" : "OK";
+    if (ObjectAccessor::FindConnectedPlayer(targetGuid))
+        reason = "IN_USE";
+
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << lowGuid
+        << kFieldSeparator << UrlEncodeField(target->Name)
+        << kFieldSeparator << "OFFLINE"
+        << kFieldSeparator << reason;
+    SendAddonPacket(
+        requester, replyType, "BOT_LIFECYCLE_STATE", out.str());
+}
+
+void RunBotLifecycleConnect(
+    Player* requester,
+    ChatMsg replyType,
+    uint32 lowGuid,
+    std::string const& requestToken)
+{
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+    std::string reason;
+    if (!ResolveBotLifecycleTarget(
+            requester, lowGuid, targetGuid, target, reason))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, "",
+            "CONNECT", "ERR", reason);
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "ERR", "NO_MANAGER");
+        return;
+    }
+
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        ClearBotLifecyclePendingConnect(requester, lowGuid);
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "OK", "ALREADY_ONLINE");
+        return;
+    }
+
+    bool timedOut = false;
+    if (GetBotLifecyclePendingConnect(requester, lowGuid, timedOut))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "PENDING", "ALREADY_CONNECTING");
+        return;
+    }
+
+    if (!IsBotLifecycleControlRelationAllowed(
+            requester, mgr, targetGuid, *target))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "ERR", "FORBIDDEN");
+        return;
+    }
+
+    if (ObjectAccessor::FindConnectedPlayer(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "ERR", "IN_USE");
+        return;
+    }
+
+    std::size_t const pendingCount =
+        CountBotLifecyclePendingConnects(requester);
+    uint32 const maxBots =
+        uint32(PlayerbotAIConfig::instance().maxAddedBots);
+    if (mgr->GetPlayerbotsCount() + pendingCount >= maxBots)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "ERR", "MAX_BOTS");
+        return;
+    }
+
+    if (!StartBotLifecyclePendingConnect(requester, lowGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "ERR", "TOO_MANY_PENDING");
+        return;
+    }
+
+    mgr->AddPlayerBot(
+        targetGuid,
+        requester->GetSession()->GetAccountId());
+
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        ClearBotLifecyclePendingConnect(requester, lowGuid);
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "CONNECT", "OK", "ONLINE");
+        return;
+    }
+
+    SendBotLifecycleResultPacket(
+        requester, replyType, requestToken, lowGuid, target->Name,
+        "CONNECT", "PENDING", "STARTED");
+}
+
+void RunBotLifecycleDisconnect(
+    Player* requester,
+    ChatMsg replyType,
+    uint32 lowGuid,
+    std::string const& requestToken)
+{
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+    std::string reason;
+    if (!ResolveBotLifecycleTarget(
+            requester, lowGuid, targetGuid, target, reason))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, "",
+            "DISCONNECT", "ERR", reason);
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT", "ERR", "NO_MANAGER");
+        return;
+    }
+
+    Player* const bot = mgr->GetPlayerBot(targetGuid);
+    if (!bot)
+    {
+        bool timedOut = false;
+        if (GetBotLifecyclePendingConnect(
+                requester, lowGuid, timedOut))
+        {
+            SendBotLifecycleResultPacket(
+                requester, replyType, requestToken, lowGuid, target->Name,
+                "DISCONNECT", "ERR", "CONNECTING");
+            return;
+        }
+
+        ClearBotLifecyclePendingConnect(requester, lowGuid);
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT", "OK", "ALREADY_OFFLINE");
+        return;
+    }
+
+    mgr->LogoutPlayerBot(targetGuid);
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT", "ERR", "STATE_MISMATCH");
+        return;
+    }
+
+    ClearBotLifecyclePendingConnect(requester, lowGuid);
+    SendBotLifecycleResultPacket(
+        requester, replyType, requestToken, lowGuid, target->Name,
+        "DISCONNECT", "OK", "OFFLINE");
+}
+
+// MB_BOT_TARGET_RESOLVE_V1_BEGIN
+void SendBotTargetResolvePacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& status,
+    std::string const& reason,
+    std::string const& canonicalName,
+    uint32 lowGuid,
+    std::string const& lifecycleState)
+{
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << status
+        << kFieldSeparator << reason
+        << kFieldSeparator << UrlEncodeField(canonicalName)
+        << kFieldSeparator << lowGuid
+        << kFieldSeparator << lifecycleState;
+
+    SendAddonPacket(requester, replyType, "BOT_TARGET_RESOLVE", out.str());
+}
+
+bool ResolveBotLifecycleTargetByName(
+    Player* requester,
+    std::string const& requestedName,
+    ObjectGuid& targetGuid,
+    CharacterCacheEntry const*& target)
+{
+    target = nullptr;
+
+    if (!requester || !requester->GetSession())
+        return false;
+
+    std::string normalizedName = requestedName;
+    if (normalizedName != Trim(normalizedName))
+        return false;
+
+    if (!normalizePlayerName(normalizedName))
+        return false;
+
+    targetGuid = sCharacterCache->GetCharacterGuidByName(normalizedName);
+    if (targetGuid.IsEmpty() || targetGuid == requester->GetGUID())
+        return false;
+
+    target = sCharacterCache->GetCharacterCacheByGuid(targetGuid);
+    return target != nullptr;
+}
+
+void RunBotTargetResolveRequest(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestedName,
+    std::string const& requestToken)
+{
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+
+    if (!ResolveBotLifecycleTargetByName(requester, requestedName, targetGuid, target))
+    {
+        SendBotTargetResolvePacket(
+            requester, replyType, requestToken,
+            "ERR", "NOT_ALLOWED", "", 0, "UNKNOWN");
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr || !IsBotLifecycleControlRelationAllowed(
+            requester, mgr, targetGuid, *target))
+    {
+        SendBotTargetResolvePacket(
+            requester, replyType, requestToken,
+            "ERR", "NOT_ALLOWED", "", 0, "UNKNOWN");
+        return;
+    }
+
+    uint32 const lowGuid = targetGuid.GetCounter();
+
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        ClearBotLifecyclePendingConnect(requester, lowGuid);
+        SendBotTargetResolvePacket(
+            requester, replyType, requestToken,
+            "OK", "OK", target->Name, lowGuid, "ONLINE");
+        return;
+    }
+
+    bool timedOut = false;
+    if (GetBotLifecyclePendingConnect(requester, lowGuid, timedOut))
+    {
+        SendBotTargetResolvePacket(
+            requester, replyType, requestToken,
+            "OK", "PENDING", target->Name, lowGuid, "CONNECTING");
+        return;
+    }
+
+    std::string reason = timedOut ? "TIMEOUT" : "OK";
+    if (ObjectAccessor::FindConnectedPlayer(targetGuid))
+        reason = "IN_USE";
+
+    SendBotTargetResolvePacket(
+        requester, replyType, requestToken,
+        "OK", reason, target->Name, lowGuid, "OFFLINE");
+}
+// MB_BOT_TARGET_RESOLVE_V1_END
+// MB_BOT_LIFECYCLE_V1_END
+
 std::string BuildRosterPayload(Player* player)
 {
     std::ostringstream out;
@@ -12378,6 +13209,78 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "ALT_ROSTER")
+        {
+            if (fields.size() != 1)
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_FIELD_COUNT");
+
+            if (!ConsumeAltRosterRequestRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "RATE_LIMIT");
+
+            SendAltRosterPackets(player, replyType);
+            return true;
+        }
+
+        if (requestType == "BOT_TARGET_RESOLVE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            std::string targetName;
+            if (!TryUrlDecodeField(fields[1], targetName, kMaxBotNameLength, false))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_NAME");
+
+            if (targetName != Trim(targetName))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_NAME");
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeBotLifecycleQueryRateLimit(player))
+            {
+                SendBotTargetResolvePacket(
+                    player, replyType, fields[2],
+                    "ERR", "RATE_LIMIT", "", 0, "UNKNOWN");
+                return true;
+            }
+
+            RunBotTargetResolveRequest(
+                player, replyType, targetName, fields[2]);
+            return true;
+        }
+        if (requestType == "BOT_LIFECYCLE_STATE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            uint32 lowGuid = 0;
+            if (!TryParseUint32Field(
+                    fields[1], 1, std::numeric_limits<uint32>::max(), lowGuid))
+            {
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_GUID");
+            }
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeBotLifecycleQueryRateLimit(player))
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            SendBotLifecycleStatePacket(
+                player, replyType, lowGuid, fields[2]);
+            return true;
+        }
+
         if (requestType == "SELF_BOT")
         {
             std::string const token = GetSafeErrorToken(fields, 1);
@@ -12777,6 +13680,54 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         return SendProtocolError(player, replyType, normalized, requestType, "", "UNKNOWN_GET");
+    }
+
+    if (requestType == "BOT_CONNECT" || requestType == "BOT_DISCONNECT")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 3)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        uint32 lowGuid = 0;
+        if (!TryParseUint32Field(
+                fields[1], 1, std::numeric_limits<uint32>::max(), lowGuid))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_GUID");
+        }
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const action =
+            requestType == "BOT_CONNECT" ? "CONNECT" : "DISCONNECT";
+
+        if (!ConsumeBotLifecycleMutationRateLimit(player))
+        {
+            SendBotLifecycleResultPacket(
+                player, replyType, fields[2], lowGuid, "",
+                action, "ERR", "RATE_LIMIT");
+            return true;
+        }
+
+        if (!RegisterBotLifecycleMutationToken(player, fields[2]))
+        {
+            SendBotLifecycleResultPacket(
+                player, replyType, fields[2], lowGuid, "",
+                action, "ERR", "REPLAY");
+            return true;
+        }
+
+        if (requestType == "BOT_CONNECT")
+            RunBotLifecycleConnect(
+                player, replyType, lowGuid, fields[2]);
+        else
+            RunBotLifecycleDisconnect(
+                player, replyType, lowGuid, fields[2]);
+
+        return true;
     }
 
     if (requestType == "SELF_BOT")
