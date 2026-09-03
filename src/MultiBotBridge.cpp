@@ -219,6 +219,7 @@ char const* const kSelfStrategyCapability = "SELF_STRATEGY_V1";
 char const* const kSelfActionCapability = "SELF_ACTION_V1";
 char const* const kAltRosterCapability = "ALT_ROSTER_V1";
 char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
+char const* const kBotGroupRemoveCapability = "BOT_GROUP_REMOVE_V1";
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
@@ -354,6 +355,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kSelfActionCapability,
         kAltRosterCapability,
         kBotLifecycleCapability,
+        kBotGroupRemoveCapability,
         kBotTargetResolveCapability,
 kFollowOrderCapability,
 kStayOrderCapability,
@@ -12310,6 +12312,148 @@ void RunBotLifecycleDisconnect(
         "DISCONNECT", "OK", "OFFLINE");
 }
 
+// MB_BOT_GROUP_REMOVE_V1_BEGIN
+void RunBotLifecycleDisconnectGroup(
+    Player* requester,
+    ChatMsg replyType,
+    uint32 lowGuid,
+    std::string const& requestToken)
+{
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+    std::string reason;
+    if (!ResolveBotLifecycleTarget(
+            requester, lowGuid, targetGuid, target, reason))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, "",
+            "DISCONNECT_GROUP", "ERR", reason);
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "NO_MANAGER");
+        return;
+    }
+
+    Player* const bot = mgr->GetPlayerBot(targetGuid);
+    if (!bot)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "BOT_NOT_ONLINE");
+        return;
+    }
+
+    Group* const group = requester->GetGroup();
+    if (!group || bot->GetGroup() != group || !group->IsMember(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "NOT_IN_GROUP");
+        return;
+    }
+
+    if (group->isLFGGroup(true) || group->isBGGroup() || group->isBFGroup())
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "GROUP_UNSUPPORTED");
+        return;
+    }
+
+    if (group->IsLeader(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "TARGET_IS_LEADER");
+        return;
+    }
+
+    if (requester->CanUninviteFromGroup(targetGuid) != ERR_PARTY_RESULT_OK)
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "FORBIDDEN");
+        return;
+    }
+
+    Group* const originalGroup = group;
+
+    mgr->LogoutPlayerBot(targetGuid);
+    if (mgr->GetPlayerBot(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "STATE_MISMATCH");
+        return;
+    }
+
+    ClearBotLifecyclePendingConnect(requester, lowGuid);
+
+    Group* const cleanupGroup = requester->GetGroup();
+    if (cleanupGroup && cleanupGroup->IsMember(targetGuid))
+    {
+        if (cleanupGroup != originalGroup)
+        {
+            SendBotLifecycleResultPacket(
+                requester, replyType, requestToken, lowGuid, target->Name,
+                "DISCONNECT_GROUP", "ERR", "GROUP_CHANGED");
+            return;
+        }
+
+        if (cleanupGroup->isLFGGroup(true)
+            || cleanupGroup->isBGGroup()
+            || cleanupGroup->isBFGroup())
+        {
+            SendBotLifecycleResultPacket(
+                requester, replyType, requestToken, lowGuid, target->Name,
+                "DISCONNECT_GROUP", "ERR", "GROUP_UNSUPPORTED");
+            return;
+        }
+
+        if (cleanupGroup->IsLeader(targetGuid))
+        {
+            SendBotLifecycleResultPacket(
+                requester, replyType, requestToken, lowGuid, target->Name,
+                "DISCONNECT_GROUP", "ERR", "TARGET_IS_LEADER");
+            return;
+        }
+
+        if (requester->CanUninviteFromGroup(targetGuid) != ERR_PARTY_RESULT_OK)
+        {
+            SendBotLifecycleResultPacket(
+                requester, replyType, requestToken, lowGuid, target->Name,
+                "DISCONNECT_GROUP", "ERR", "FORBIDDEN");
+            return;
+        }
+
+        Player::RemoveFromGroup(
+            cleanupGroup,
+            targetGuid,
+            GROUP_REMOVEMETHOD_KICK,
+            requester->GetGUID());
+    }
+
+    Group* const verifyGroup = requester->GetGroup();
+    if (verifyGroup && verifyGroup->IsMember(targetGuid))
+    {
+        SendBotLifecycleResultPacket(
+            requester, replyType, requestToken, lowGuid, target->Name,
+            "DISCONNECT_GROUP", "ERR", "GROUP_STATE_MISMATCH");
+        return;
+    }
+
+    SendBotLifecycleResultPacket(
+        requester, replyType, requestToken, lowGuid, target->Name,
+        "DISCONNECT_GROUP", "OK", "OFFLINE_GROUP_REMOVED");
+}
+// MB_BOT_GROUP_REMOVE_V1_END
+
 // MB_BOT_TARGET_RESOLVE_V1_BEGIN
 void SendBotTargetResolvePacket(
     Player* requester,
@@ -13439,7 +13583,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return SendProtocolError(player, replyType, normalized, requestType, "", "UNKNOWN_GET");
     }
 
-    if (requestType == "BOT_CONNECT" || requestType == "BOT_DISCONNECT")
+    if (requestType == "BOT_CONNECT"
+        || requestType == "BOT_DISCONNECT"
+        || requestType == "BOT_DISCONNECT_GROUP")
     {
         std::string const token = GetSafeErrorToken(fields, 2);
         if (fields.size() != 3)
@@ -13459,7 +13605,11 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
         std::string const action =
-            requestType == "BOT_CONNECT" ? "CONNECT" : "DISCONNECT";
+            requestType == "BOT_CONNECT"
+                ? "CONNECT"
+                : (requestType == "BOT_DISCONNECT_GROUP"
+                    ? "DISCONNECT_GROUP"
+                    : "DISCONNECT");
 
         if (!ConsumeBotLifecycleMutationRateLimit(player))
         {
@@ -13479,6 +13629,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "BOT_CONNECT")
             RunBotLifecycleConnect(
+                player, replyType, lowGuid, fields[2]);
+        else if (requestType == "BOT_DISCONNECT_GROUP")
+            RunBotLifecycleDisconnectGroup(
                 player, replyType, lowGuid, fields[2]);
         else
             RunBotLifecycleDisconnect(
