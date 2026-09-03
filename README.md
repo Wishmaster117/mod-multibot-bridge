@@ -62,7 +62,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | --- | --- |
 | **Handshake & capability negotiation** | Detect Bridge availability and negotiate supported feature families. |
 | **Roster & presence** | Provide bridge-visible bots, account-alt presence and structured roster data. |
-| **Bot lifecycle** | Structured connect, disconnect and lifecycle state for authorized bot relationships. |
+| **Bot lifecycle** | Structured connect, disconnect and lifecycle state for authorized bot relationships, plus human-safe grouped-Playerbot removal for Raidus. |
 | **Target resolution** | Resolve an authorized bot name to the canonical lifecycle target used by social rosters. |
 | **Bot state** | Framed strategy/state reads used by the addon UI. |
 | **Strategy mutations** | Structured strategy changes for migrated controls. |
@@ -102,6 +102,32 @@ The Bridge:
 - prevents a simple offline group-membership relationship from granting lifecycle control by itself.
 
 The final authorization relationship is limited to the audited control relationships used by the project, including same-account, same-guild, AddClass and linked/trusted-account cases.
+
+---
+
+# Raidus Safe Group Removal
+
+Raidus uses the dedicated capability:
+
+```text
+BOT_GROUP_REMOVE_V1
+```
+
+This path is intentionally narrower than a generic group-kick endpoint.
+
+For a Raidus outside-layout removal, the Bridge:
+
+1. resolves the requested target;
+2. proves that the target is currently managed by `PlayerbotMgr::GetPlayerBot(targetGuid)`;
+3. requires the requester and target to be in the same normal party/raid;
+4. rejects LFG, battleground and battlefield groups;
+5. rejects removal of the group leader;
+6. reuses AzerothCore's normal `CanUninviteFromGroup()` permission semantics;
+7. logs the bot out through `PlayerbotMgr::LogoutPlayerBot(targetGuid)`;
+8. rechecks group state and removes only a residual group membership if it still exists;
+9. returns the final structured lifecycle result.
+
+A normal connected human outside the Raidus layout is therefore not eligible for this mutation: group membership, account, guild or other client-visible properties are not substitutes for proving that the target is an active managed Playerbot.
 
 ---
 
@@ -196,6 +222,7 @@ SELF_ACTION_V1
 ALT_ROSTER_V1
 BOT_LIFECYCLE_V1
 BOT_TARGET_RESOLVE_V1
+BOT_GROUP_REMOVE_V1
 FOLLOW_ORDER_V1
 STAY_ORDER_V1
 ATTACK_ORDER_V1
@@ -243,7 +270,9 @@ The project is intentionally described as **bridge-first / mostly chatless** unt
 
 Collective **Follow**, **Stay** and **Attack** are now implemented through dedicated structured Bridge endpoints and runtime validated. Their technical ACKs no longer depend on automatic chat transport or parsing, and the Bridge still exposes no generic Playerbots command executor.
 
-The next normal work is to continue auditing remaining automatic `CONTROL/PARSING` chat paths family by family while the project remains intentionally **bridge-first / mostly chatless**.
+The current lifecycle audit leaves the group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` as the next normal migration target. Its Playerbots semantics are tied to the requester's real group and must be preserved exactly; it must not become an unrestricted "all account bots" lifecycle endpoint.
+
+The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
 Deferred work is tracked in the addon roadmap:
 
