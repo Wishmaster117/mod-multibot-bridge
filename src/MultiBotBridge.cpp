@@ -52,6 +52,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -157,6 +158,9 @@ std::chrono::milliseconds constexpr kQuestAbandonRateWindow(2000);
 std::chrono::seconds constexpr kQuestAbandonReplayTtl(10);
 std::size_t constexpr kQuestAbandonMaxRecentTokens = 32;
 std::size_t constexpr kQuestAbandonMaxRequesterStates = 512;
+std::size_t constexpr kQuestProgressRateLimit = 48;
+std::chrono::milliseconds constexpr kQuestProgressRateWindow(2000);
+std::size_t constexpr kQuestProgressMaxRequesterStates = 512;
 std::size_t constexpr kGroupRollRateLimit = 4;
 std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
 std::size_t constexpr kSelfBotRateLimit = 8;
@@ -208,6 +212,8 @@ char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kLootRuleItemCapability = "LOOT_RULE_ITEM_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
+char const* const kQuestProgressCapability = "QUEST_PROGRESS_V1";
+char const* const kQuestProgressPushCapability = "QUEST_PROGRESS_PUSH_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
 char const* const kCraftRecipeTargetCapability = "CRAFT_RECIPE_TARGET_V1";
@@ -228,6 +234,7 @@ uint32 constexpr kMaxInventoryItemDestroyCount = 1000;
 uint32 constexpr kMaxInventoryItemUseCount = 1000;
 uint32 constexpr kMaxInventoryItemSellCount = 1000;
 uint32 constexpr kMaxVendorBuybackCount = 1000;
+uint32 constexpr kQuestProgressWatchIntervalMs = 500;
 
 enum class BridgePayloadStatus
 {
@@ -271,6 +278,7 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, bool watch);
 std::array<uint32, 3> BuildTalentTabPoints(Player* bot);
 uint32 GetPct(uint32 current, uint32 max);
 
@@ -331,6 +339,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryOpenCapability,
         kLootRuleItemCapability,
         kQuestAbandonCapability,
+        kQuestProgressCapability,
+        kQuestProgressPushCapability,
         kTalentApplyCapability,
         kTalentSpecApplyCapability,
         kCraftRecipeTargetCapability,
@@ -816,6 +826,84 @@ struct QuestEntryData
     uint32 questId = 0;
     bool completed = false;
 };
+
+struct QuestProgressRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, QuestProgressRateState> sQuestProgressRateStates;
+
+void PruneQuestProgressRateState(
+    QuestProgressRateState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() &&
+           now - state.requests.front() >= kQuestProgressRateWindow)
+    {
+        state.requests.pop_front();
+    }
+}
+
+bool ConsumeQuestProgressRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+
+    auto stateIt = sQuestProgressRateStates.find(key);
+
+    if (stateIt == sQuestProgressRateStates.end())
+    {
+        if (sQuestProgressRateStates.size() >= kQuestProgressMaxRequesterStates)
+        {
+            for (auto it = sQuestProgressRateStates.begin();
+                 it != sQuestProgressRateStates.end();)
+            {
+                PruneQuestProgressRateState(it->second, now);
+
+                if (it->second.requests.empty())
+                    it = sQuestProgressRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sQuestProgressRateStates.size() >= kQuestProgressMaxRequesterStates)
+            return false;
+
+        stateIt =
+            sQuestProgressRateStates.emplace(key, QuestProgressRateState()).first;
+    }
+
+    QuestProgressRateState& state = stateIt->second;
+    PruneQuestProgressRateState(state, now);
+
+    if (state.requests.size() >= kQuestProgressRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+struct QuestProgressSubscriber
+{
+    ObjectGuid requesterGuid;
+    ChatMsg replyType = CHAT_MSG_WHISPER;
+    uint64 lastFingerprint = 0;
+};
+
+struct QuestProgressWatchState
+{
+    uint32 elapsedMs = 0;
+    std::vector<QuestProgressSubscriber> subscribers;
+};
+
+std::mutex gQuestProgressWatchMutex;
+std::map<uint32, QuestProgressWatchState> gQuestProgressWatches;
+uint32 gQuestProgressPushSequence = 0;
 
 struct TalentSpecEntryData
 {
@@ -1865,6 +1953,287 @@ void SendQuestPackets(Player* player, ChatMsg replyType, std::string const& mode
         SendQuestPacketsForBot(player, replyType, bot, mode, token);
 
     SendAddonPacket(player, replyType, "QUESTS_DONE", token + std::string(1, kFieldSeparator) + mode);
+}
+
+uint64 MixQuestProgressHash(uint64 hash, uint64 value)
+{
+    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    return hash;
+}
+
+uint64 BuildQuestProgressFingerprint(Player* bot)
+{
+    if (!bot)
+        return 0;
+
+    uint64 hash = 1469598103934665603ULL;
+    QuestStatusMap const& questStatusMap = bot->getQuestStatusMap();
+
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 const questId = bot->GetQuestSlotQuestId(slot);
+        hash = MixQuestProgressHash(hash, questId);
+
+        if (!questId)
+            continue;
+
+        QuestStatus const status = bot->GetQuestStatus(questId);
+        hash = MixQuestProgressHash(hash, static_cast<uint32>(status));
+
+        auto const statusItr = questStatusMap.find(questId);
+        if (statusItr == questStatusMap.end())
+            continue;
+
+        QuestStatusData const& progress = statusItr->second;
+
+        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+            hash = MixQuestProgressHash(hash, progress.CreatureOrGOCount[i]);
+
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+            hash = MixQuestProgressHash(hash, progress.ItemCount[i]);
+
+        hash = MixQuestProgressHash(hash, progress.PlayerCount);
+        hash = MixQuestProgressHash(hash, progress.Explored ? 1 : 0);
+    }
+
+    return hash;
+}
+
+void SendQuestProgressObjectivePacket(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& token, uint32 questId, char objectiveType, uint8 sourceSlot, uint32 objectiveId, uint32 current, uint32 required)
+{
+    if (!requester || !required)
+        return;
+
+    current = std::min(current, required);
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << token
+        << kFieldSeparator << questId
+        << kFieldSeparator << objectiveType
+        << kFieldSeparator << static_cast<uint32>(sourceSlot)
+        << kFieldSeparator << objectiveId
+        << kFieldSeparator << current
+        << kFieldSeparator << required;
+
+    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_OBJECTIVE", payload.str());
+}
+
+void SendQuestProgressSnapshot(Player* requester, ChatMsg replyType, Player* bot, std::string const& token)
+{
+    if (!requester || !bot)
+        return;
+
+    std::string const botName = bot->GetName();
+    std::string const headerPayload = UrlEncodeField(botName) + std::string(1, kFieldSeparator) + token;
+    QuestStatusMap const& questStatusMap = bot->getQuestStatusMap();
+
+    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_BEGIN", headerPayload);
+
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 const questId = bot->GetQuestSlotQuestId(slot);
+        if (!questId)
+            continue;
+
+        QuestStatus const status = bot->GetQuestStatus(questId);
+        if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE && status != QUEST_STATUS_FAILED)
+            continue;
+
+        std::ostringstream payload;
+        payload << UrlEncodeField(botName)
+            << kFieldSeparator << token
+            << kFieldSeparator << questId
+            << kFieldSeparator << (status == QUEST_STATUS_COMPLETE ? "C" : status == QUEST_STATUS_FAILED ? "F" : "I");
+
+        SendAddonPacket(requester, replyType, "QUEST_PROGRESS_QUEST", payload.str());
+
+        Quest const* const quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+            continue;
+
+        auto const statusItr = questStatusMap.find(questId);
+        if (statusItr == questStatusMap.end())
+            continue;
+
+        QuestStatusData const& progress = statusItr->second;
+
+        for (uint8 objectiveIndex = 0; objectiveIndex < QUEST_OBJECTIVES_COUNT; ++objectiveIndex)
+        {
+            int32 const targetId = quest->RequiredNpcOrGo[objectiveIndex];
+            uint32 const required = quest->RequiredNpcOrGoCount[objectiveIndex];
+
+            if (!targetId || !required)
+                continue;
+
+            char const objectiveType = targetId > 0 ? 'm' : 'o';
+            uint32 const objectiveId = targetId > 0 ? static_cast<uint32>(targetId) : static_cast<uint32>(-targetId);
+
+            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, objectiveType, objectiveIndex + 1, objectiveId, progress.CreatureOrGOCount[objectiveIndex], required);
+        }
+
+        for (uint8 objectiveIndex = 0; objectiveIndex < QUEST_ITEM_OBJECTIVES_COUNT; ++objectiveIndex)
+        {
+            uint32 const itemId = quest->RequiredItemId[objectiveIndex];
+            uint32 const required = quest->RequiredItemCount[objectiveIndex];
+
+            if (!itemId || !required)
+                continue;
+
+            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'i', objectiveIndex + 1, itemId, progress.ItemCount[objectiveIndex], required);
+        }
+
+        uint32 const requiredPlayerKills = quest->GetPlayersSlain();
+        if (requiredPlayerKills)
+            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'p', 1, 0, progress.PlayerCount, requiredPlayerKills);
+
+        if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT))
+            SendQuestProgressObjectivePacket(requester, replyType, botName, token, questId, 'e', 1, 0, progress.Explored ? 1 : 0, 1);
+    }
+
+    SendAddonPacket(requester, replyType, "QUEST_PROGRESS_END", headerPayload);
+}
+
+void RegisterQuestProgressWatch(Player* requester, ChatMsg replyType, Player* bot)
+{
+    if (!requester || !bot)
+        return;
+
+    Group* const botGroup = bot->GetGroup();
+    if (!botGroup || requester->GetGroup() != botGroup)
+        return;
+
+    uint32 const botGuid = bot->GetGUID().GetCounter();
+    uint64 const fingerprint = BuildQuestProgressFingerprint(bot);
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
+
+    QuestProgressWatchState& watch = gQuestProgressWatches[botGuid];
+
+    for (QuestProgressSubscriber& subscriber : watch.subscribers)
+    {
+        if (subscriber.requesterGuid == requester->GetGUID())
+        {
+            subscriber.replyType = replyType;
+            subscriber.lastFingerprint = fingerprint;
+            return;
+        }
+    }
+
+    QuestProgressSubscriber subscriber;
+    subscriber.requesterGuid = requester->GetGUID();
+    subscriber.replyType = replyType;
+    subscriber.lastFingerprint = fingerprint;
+    watch.subscribers.push_back(subscriber);
+}
+
+void SendQuestProgressPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& token, bool watch)
+{
+    if (!requester)
+        return;
+
+    Player* const bot = FindBotByName(requester, botNameValue);
+    if (!bot)
+    {
+        SendAddonPacket(requester, replyType, "QUEST_PROGRESS_END", UrlEncodeField(botNameValue) + std::string(1, kFieldSeparator) + token + std::string(1, kFieldSeparator) + "NO_BOT");
+        return;
+    }
+
+    if (watch)
+        RegisterQuestProgressWatch(requester, replyType, bot);
+
+    SendQuestProgressSnapshot(requester, replyType, bot, token);
+}
+
+std::string MakeQuestProgressPushToken(Player* bot)
+{
+    ++gQuestProgressPushSequence;
+    return "qpp" + std::to_string(bot->GetGUID().GetCounter()) + "x" + std::to_string(gQuestProgressPushSequence);
+}
+
+void UpdateQuestProgressWatch(Player* bot, uint32 diff)
+{
+    if (!bot)
+        return;
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
+
+    uint32 const botGuid = bot->GetGUID().GetCounter();
+    auto watchItr = gQuestProgressWatches.find(botGuid);
+    if (watchItr == gQuestProgressWatches.end())
+        return;
+
+    QuestProgressWatchState& watch = watchItr->second;
+    watch.elapsedMs += diff;
+
+    if (watch.elapsedMs < kQuestProgressWatchIntervalMs)
+        return;
+
+    watch.elapsedMs = 0;
+
+    Group* const botGroup = bot->GetGroup();
+    if (!botGroup)
+    {
+        gQuestProgressWatches.erase(watchItr);
+        return;
+    }
+
+    uint64 const fingerprint = BuildQuestProgressFingerprint(bot);
+
+    for (auto subscriberItr = watch.subscribers.begin(); subscriberItr != watch.subscribers.end();)
+    {
+        Player* const requester = ObjectAccessor::FindConnectedPlayer(subscriberItr->requesterGuid);
+
+        if (!requester || requester->GetGroup() != botGroup)
+        {
+            subscriberItr = watch.subscribers.erase(subscriberItr);
+            continue;
+        }
+
+        if (fingerprint != subscriberItr->lastFingerprint)
+        {
+            SendQuestProgressSnapshot(requester, subscriberItr->replyType, bot, MakeQuestProgressPushToken(bot));
+            subscriberItr->lastFingerprint = fingerprint;
+        }
+
+        ++subscriberItr;
+    }
+
+    if (watch.subscribers.empty())
+        gQuestProgressWatches.erase(watchItr);
+}
+
+void RemoveQuestProgressWatchesForPlayer(Player* player)
+{
+    if (!player)
+        return;
+
+    ObjectGuid const playerGuid = player->GetGUID();
+    uint32 const playerLowGuid = playerGuid.GetCounter();
+
+    std::lock_guard<std::mutex> guard(gQuestProgressWatchMutex);
+
+    gQuestProgressWatches.erase(playerLowGuid);
+
+    for (auto watchItr = gQuestProgressWatches.begin(); watchItr != gQuestProgressWatches.end();)
+    {
+        std::vector<QuestProgressSubscriber>& subscribers = watchItr->second.subscribers;
+
+        subscribers.erase(
+            std::remove_if(
+                subscribers.begin(),
+                subscribers.end(),
+                [&playerGuid](QuestProgressSubscriber const& subscriber)
+                {
+                    return subscriber.requesterGuid == playerGuid;
+                }),
+            subscribers.end());
+
+        if (subscribers.empty())
+            watchItr = gQuestProgressWatches.erase(watchItr);
+        else
+            ++watchItr;
+    }
 }
 
 void AppendGameObjectUnitLines(PlayerbotAI* botAI, std::vector<std::string>& lines, std::string const& title, std::string const& valueName)
@@ -12832,6 +13201,36 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "QUEST_PROGRESS")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+
+            if (fields.size() != 3 && fields.size() != 4)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            bool watch = false;
+
+            if (fields.size() == 4)
+            {
+                if (fields[3] != "WATCH")
+                    return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_MODE");
+
+                watch = true;
+            }
+
+            if (!ConsumeQuestProgressRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "RATE_LIMIT");
+
+            SendQuestProgressPackets(player, replyType, fields[1], fields[2], watch);
+            return true;
+        }
+
         if (requestType == "GAMEOBJECTS")
         {
             std::string const token = GetSafeErrorToken(fields, 2);
@@ -13872,9 +14271,15 @@ public:
         NotifyPendingWarlockStoneItemCreated(player, item);
     }
 
+    void OnPlayerUpdate(Player* player, uint32 p_time) override
+    {
+        UpdateQuestProgressWatch(player, p_time);
+    }
+
     void OnPlayerBeforeLogout(Player* player) override
     {
         CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
+        RemoveQuestProgressWatchesForPlayer(player);
     }
 
     void OnPlayerMapChanged(Player* player) override
