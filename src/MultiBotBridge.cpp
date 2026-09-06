@@ -221,6 +221,7 @@ char const* const kAltRosterCapability = "ALT_ROSTER_V1";
 char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
 char const* const kBotGroupRemoveCapability = "BOT_GROUP_REMOVE_V1";
 char const* const kBotGroupLifecycleCapability = "BOT_GROUP_LIFECYCLE_V1";
+char const* const kCreatorAddClassCapability = "CREATOR_ADDCLASS_V1";
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
@@ -358,6 +359,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kBotLifecycleCapability,
         kBotGroupRemoveCapability,
         kBotGroupLifecycleCapability,
+        kCreatorAddClassCapability,
         kBotTargetResolveCapability,
 kFollowOrderCapability,
 kStayOrderCapability,
@@ -12457,6 +12459,102 @@ void RunBotLifecycleDisconnectGroup(
 // MB_BOT_GROUP_REMOVE_V1_END
 
 
+// MB_CREATOR_ADDCLASS_V1_BEGIN
+void SendCreatorAddClassResultPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& className,
+    std::string const& gender,
+    std::string const& status,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << className
+        << kFieldSeparator << gender
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(
+        requester,
+        replyType,
+        "CREATOR_ADDCLASS",
+        out.str());
+}
+
+void RunCreatorAddClassCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& className,
+    std::string const& gender)
+{
+    if (!requester || !requester->GetSession())
+    {
+        SendCreatorAddClassResultPacket(
+            requester, replyType, requestToken, className, gender,
+            "ERR", "NO_SESSION");
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendCreatorAddClassResultPacket(
+            requester, replyType, requestToken, className, gender,
+            "ERR", "NO_MANAGER");
+        return;
+    }
+
+    std::string command = "addclass " + className;
+    if (gender != "random")
+        command += " " + gender;
+
+    std::vector<std::string> const messages =
+        mgr->HandlePlayerbotCommand(command.c_str(), requester);
+
+    std::string const successMessage = "Add class " + className;
+    bool const success =
+        std::find(messages.begin(), messages.end(), successMessage) != messages.end();
+
+    std::string reason = "PLAYERBOTS_REJECTED";
+    if (success)
+        reason = "OK";
+    else if (std::find(
+                 messages.begin(),
+                 messages.end(),
+                 "You do not have permission to create bot by addclass command")
+             != messages.end())
+        reason = "NOT_ALLOWED";
+    else if (std::find(
+                 messages.begin(),
+                 messages.end(),
+                 "Your level is too low to summon Deathknight")
+             != messages.end())
+        reason = "DK_LEVEL_TOO_LOW";
+    else if (std::find(
+                 messages.begin(),
+                 messages.end(),
+                 "Add class failed, no available characters!")
+             != messages.end())
+        reason = "NO_AVAILABLE";
+    else if (messages.empty())
+        reason = "NO_RESULT";
+
+    SendCreatorAddClassResultPacket(
+        requester,
+        replyType,
+        requestToken,
+        className,
+        gender,
+        success ? "OK" : "ERR",
+        reason);
+}
+// MB_CREATOR_ADDCLASS_V1_END
 // MB_BOT_GROUP_LIFECYCLE_V1_BEGIN
 void SendBotGroupLifecycleResultPacket(
     Player* requester,
@@ -13873,6 +13971,62 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "CREATOR_ADDCLASS")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const className = ToLower(Trim(fields[2]));
+        if (fields[2] != className
+            || (className != "warrior"
+                && className != "paladin"
+                && className != "hunter"
+                && className != "rogue"
+                && className != "priest"
+                && className != "shaman"
+                && className != "mage"
+                && className != "warlock"
+                && className != "druid"
+                && className != "dk"))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_CLASS");
+        }
+
+        std::string const gender = ToLower(Trim(fields[3]));
+        if (fields[3] != gender
+            || (gender != "random" && gender != "male" && gender != "female"))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_GENDER");
+        }
+
+        if (!ConsumeBotLifecycleMutationRateLimit(player))
+        {
+            SendCreatorAddClassResultPacket(
+                player, replyType, fields[1], className, gender,
+                "ERR", "RATE_LIMIT");
+            return true;
+        }
+
+        if (!RegisterBotLifecycleMutationToken(player, fields[1]))
+        {
+            SendCreatorAddClassResultPacket(
+                player, replyType, fields[1], className, gender,
+                "ERR", "REPLAY");
+            return true;
+        }
+
+        RunCreatorAddClassCommand(
+            player, replyType, fields[1], className, gender);
+        return true;
+    }
     if (requestType == "BOT_GROUP_LIFECYCLE")
     {
         std::string const token = GetSafeErrorToken(fields, 1);

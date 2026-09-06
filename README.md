@@ -62,7 +62,8 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | --- | --- |
 | **Handshake & capability negotiation** | Detect Bridge availability and negotiate supported feature families. |
 | **Roster & presence** | Provide bridge-visible bots, account-alt presence and structured roster data. |
-| **Bot lifecycle** | Structured connect, disconnect and lifecycle state for authorized bot relationships, plus human-safe grouped-Playerbot removal for Raidus. |
+| **Bot lifecycle** | Structured unit connect/disconnect/state, bounded real-group bulk connect/disconnect for the Faction Banner, plus human-safe grouped-Playerbot removal for Raidus. |
+| **Creator AddClass** | Dedicated `CREATOR_ADDCLASS_V1` endpoint for validated class/gender AddClass requests without exposing an arbitrary Playerbots command channel. |
 | **Target resolution** | Resolve an authorized bot name to the canonical lifecycle target used by social rosters. |
 | **Bot state** | Framed strategy/state reads used by the addon UI. |
 | **Strategy mutations** | Structured strategy changes for migrated controls. |
@@ -102,6 +103,47 @@ The Bridge:
 - prevents a simple offline group-membership relationship from granting lifecycle control by itself.
 
 The final authorization relationship is limited to the audited control relationships used by the project, including same-account, same-guild, AddClass and linked/trusted-account cases.
+
+---
+
+# Bulk Group Lifecycle
+
+The Faction Banner bulk lifecycle path uses the dedicated capability:
+
+```text
+BOT_GROUP_LIFECYCLE_V1
+```
+
+The endpoint accepts only the bounded actions `CONNECT` and `DISCONNECT`. Its scope is copied from the requester's current server-side `Group::MemberSlotList`, with the requester excluded and a maximum of 39 targets.
+
+The Bridge preserves the audited Playerbots lifecycle model:
+
+- `CONNECT` delegates actual login to `PlayerbotMgr::AddPlayerBot(...)`;
+- `DISCONNECT` applies only to currently managed Playerbots and delegates logout to `PlayerbotMgr::LogoutPlayerBot(...)`;
+- disconnect does **not** force-remove the group slot;
+- authorization, pending-connect accounting, lifecycle rate limiting and replay protection stay server-side;
+- connected/non-managed members are not logged out by the Bridge;
+- no direct `RemoveFromPlayerbotsMap()` or `WorldSession::LogoutPlayer()` path is introduced.
+
+This intentionally preserves the historical Playerbots group `*` behavior without exposing a generic bulk command executor.
+
+---
+
+# Creator AddClass
+
+The Creator AddClass flow uses the dedicated capability:
+
+```text
+CREATOR_ADDCLASS_V1
+```
+
+The addon sends only the validated semantic fields `class` and `gender`. The Bridge accepts only the audited class whitelist and `random` / `male` / `female` gender values, then constructs the specialized Playerbots `addclass` operation server-side.
+
+The Bridge does **not** accept a raw Playerbots command from the addon and does not expose a generic Playerbots executor. Existing Playerbots AddClass behavior remains authoritative, including permission checks, AddClass pool selection and Death Knight level restrictions.
+
+Runtime validation on **6 September 2026** confirmed Random, Male, Female and Death Knight AddClass flows, preserved addon auto-group/roster behavior, and no legacy `.playerbot bot addclass ...` SAY on the normal bridge-first path.
+
+`init=auto` remains outside this endpoint and is intentionally unchanged pending its own targeted migration.
 
 ---
 
@@ -223,6 +265,7 @@ ALT_ROSTER_V1
 BOT_LIFECYCLE_V1
 BOT_TARGET_RESOLVE_V1
 BOT_GROUP_REMOVE_V1
+BOT_GROUP_LIFECYCLE_V1
 FOLLOW_ORDER_V1
 STAY_ORDER_V1
 ATTACK_ORDER_V1
@@ -270,7 +313,9 @@ The project is intentionally described as **bridge-first / mostly chatless** unt
 
 Collective **Follow**, **Stay** and **Attack** are now implemented through dedicated structured Bridge endpoints and runtime validated. Their technical ACKs no longer depend on automatic chat transport or parsing, and the Bridge still exposes no generic Playerbots command executor.
 
-The current lifecycle audit leaves the group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` as the next normal migration target. Its Playerbots semantics are tied to the requester's real group and must be preserved exactly; it must not become an unrestricted "all account bots" lifecycle endpoint.
+The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` is now migrated through `BOT_GROUP_LIFECYCLE_V1`. Runtime validation confirmed structured disconnect/reconnect of grouped Playerbots without forcing group-slot removal, while the actual login/logout operations remain delegated to Playerbots.
+
+Creator `addclass` is now migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. `init=auto` remains the next Creator/init sub-path; obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
