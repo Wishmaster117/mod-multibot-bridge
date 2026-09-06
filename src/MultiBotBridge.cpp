@@ -222,6 +222,9 @@ char const* const kBotLifecycleCapability = "BOT_LIFECYCLE_V1";
 char const* const kBotGroupRemoveCapability = "BOT_GROUP_REMOVE_V1";
 char const* const kBotGroupLifecycleCapability = "BOT_GROUP_LIFECYCLE_V1";
 char const* const kCreatorAddClassCapability = "CREATOR_ADDCLASS_V1";
+char const* const kCreatorInitAutoCapability = "CREATOR_INIT_AUTO_V1";
+std::chrono::seconds constexpr kCreatorInitAutoRateWindow(3);
+std::size_t constexpr kCreatorInitAutoMaxRequesterStates = 512;
 char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
@@ -360,6 +363,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kBotGroupRemoveCapability,
         kBotGroupLifecycleCapability,
         kCreatorAddClassCapability,
+        kCreatorInitAutoCapability,
         kBotTargetResolveCapability,
 kFollowOrderCapability,
 kStayOrderCapability,
@@ -12555,6 +12559,283 @@ void RunCreatorAddClassCommand(
         reason);
 }
 // MB_CREATOR_ADDCLASS_V1_END
+// MB_CREATOR_INIT_AUTO_V1_BEGIN
+enum class CreatorInitAutoOutcome
+{
+    Initialized,
+    Skipped,
+    Failed
+};
+
+bool ConsumeCreatorInitAutoRateLimit(Player* requester)
+{
+    using Clock = std::chrono::steady_clock;
+    static std::map<uint32, Clock::time_point> states;
+
+    if (!requester)
+        return false;
+
+    Clock::time_point const now = Clock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto existingIt = states.find(requesterKey);
+    if (existingIt != states.end())
+    {
+        if (now - existingIt->second < kCreatorInitAutoRateWindow)
+            return false;
+
+        states.erase(existingIt);
+    }
+
+    if (states.size() >= kCreatorInitAutoMaxRequesterStates)
+    {
+        for (auto stateIt = states.begin(); stateIt != states.end();)
+        {
+            if (now - stateIt->second >= kCreatorInitAutoRateWindow)
+                stateIt = states.erase(stateIt);
+            else
+                ++stateIt;
+        }
+    }
+
+    if (states.size() >= kCreatorInitAutoMaxRequesterStates)
+        return false;
+
+    states[requesterKey] = now;
+    return true;
+}
+
+void SendCreatorInitAutoResultPacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& mode,
+    std::string const& status,
+    std::string const& reason,
+    uint32 total,
+    uint32 initialized,
+    uint32 skipped,
+    uint32 failed)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream out;
+    out << requestToken
+        << kFieldSeparator << mode
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << total
+        << kFieldSeparator << initialized
+        << kFieldSeparator << skipped
+        << kFieldSeparator << failed;
+
+    SendAddonPacket(requester, replyType, "CREATOR_INIT_AUTO", out.str());
+}
+
+CreatorInitAutoOutcome ClassifyCreatorInitAutoResult(
+    std::string const& result,
+    std::string& reason)
+{
+    if (result.rfind("ok", 0) == 0)
+    {
+        reason = "OK";
+        return CreatorInitAutoOutcome::Initialized;
+    }
+
+    if (result == "ERROR: You can only use this command on addclass bots.")
+    {
+        reason = "NOT_ADDCLASS";
+        return CreatorInitAutoOutcome::Skipped;
+    }
+
+    if (result == "bot not found")
+    {
+        reason = "NOT_BOT";
+        return CreatorInitAutoOutcome::Skipped;
+    }
+
+    if (result == "ERROR: You can not use this command during combat.")
+    {
+        reason = "COMBAT";
+        return CreatorInitAutoOutcome::Failed;
+    }
+
+    if (result == "Initialization already in progress, please wait.")
+    {
+        reason = "IN_PROGRESS";
+        return CreatorInitAutoOutcome::Failed;
+    }
+
+    if (result == "bot system is disabled")
+    {
+        reason = "DISABLED";
+        return CreatorInitAutoOutcome::Failed;
+    }
+
+    reason = "PLAYERBOTS_REJECTED";
+    return CreatorInitAutoOutcome::Failed;
+}
+
+std::string RunCreatorInitAutoForGuid(
+    PlayerbotMgr* mgr,
+    Player* requester,
+    ObjectGuid targetGuid)
+{
+    if (!mgr || !requester || !requester->GetSession())
+        return "bot not found";
+
+    return mgr->ProcessBotCommand(
+        "init=auto",
+        targetGuid,
+        requester->GetGUID(),
+        requester->CanBeGameMaster(),
+        requester->GetSession()->GetAccountId(),
+        requester->GetGuildId());
+}
+
+bool ResolveBotLifecycleTargetByName(
+    Player* requester,
+    std::string const& requestedName,
+    ObjectGuid& targetGuid,
+    CharacterCacheEntry const*& target);
+
+void RunCreatorInitAutoTarget(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& targetName)
+{
+    if (!requester || !requester->GetSession())
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "TARGET",
+            "ERR", "NO_SESSION", 0, 0, 0, 0);
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "TARGET",
+            "ERR", "NO_MANAGER", 0, 0, 0, 0);
+        return;
+    }
+
+    ObjectGuid targetGuid;
+    CharacterCacheEntry const* target = nullptr;
+    if (!ResolveBotLifecycleTargetByName(requester, targetName, targetGuid, target))
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "TARGET",
+            "ERR", "NOT_ALLOWED", 0, 0, 0, 0);
+        return;
+    }
+
+    if (!mgr->GetPlayerBot(targetGuid))
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "TARGET",
+            "ERR", "NOT_CONTROLLED", 1, 0, 1, 0);
+        return;
+    }
+
+    std::string result = RunCreatorInitAutoForGuid(mgr, requester, targetGuid);
+    std::string reason;
+    CreatorInitAutoOutcome const outcome = ClassifyCreatorInitAutoResult(result, reason);
+
+    uint32 const initialized = outcome == CreatorInitAutoOutcome::Initialized ? 1 : 0;
+    uint32 const skipped = outcome == CreatorInitAutoOutcome::Skipped ? 1 : 0;
+    uint32 const failed = outcome == CreatorInitAutoOutcome::Failed ? 1 : 0;
+    std::string const status = initialized == 1 ? "OK" : "ERR";
+
+    SendCreatorInitAutoResultPacket(
+        requester, replyType, requestToken, "TARGET",
+        status, reason, 1, initialized, skipped, failed);
+}
+
+void RunCreatorInitAutoGroup(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken)
+{
+    if (!requester || !requester->GetSession())
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "GROUP",
+            "ERR", "NO_SESSION", 0, 0, 0, 0);
+        return;
+    }
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (!mgr)
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "GROUP",
+            "ERR", "NO_MANAGER", 0, 0, 0, 0);
+        return;
+    }
+
+    Group* const group = requester->GetGroup();
+    if (!group)
+    {
+        SendCreatorInitAutoResultPacket(
+            requester, replyType, requestToken, "GROUP",
+            "ERR", "NO_GROUP", 0, 0, 0, 0);
+        return;
+    }
+
+    Group::MemberSlotList slots = group->GetMemberSlots();
+    uint32 total = 0;
+    uint32 initialized = 0;
+    uint32 skipped = 0;
+    uint32 failed = 0;
+
+    for (Group::member_citerator i = slots.begin(); i != slots.end(); ++i)
+    {
+        ObjectGuid const memberGuid = i->guid;
+        if (memberGuid == requester->GetGUID())
+            continue;
+
+        ++total;
+
+        if (!mgr->GetPlayerBot(memberGuid))
+        {
+            ++skipped;
+            continue;
+        }
+
+        std::string result = RunCreatorInitAutoForGuid(mgr, requester, memberGuid);
+        std::string reason;
+        CreatorInitAutoOutcome const outcome = ClassifyCreatorInitAutoResult(result, reason);
+
+        if (outcome == CreatorInitAutoOutcome::Initialized)
+            ++initialized;
+        else if (outcome == CreatorInitAutoOutcome::Skipped)
+            ++skipped;
+        else
+            ++failed;
+    }
+
+    std::string status;
+    std::string reason;
+    if (initialized > 0)
+    {
+        status = "OK";
+        reason = failed > 0 ? "PARTIAL" : "OK";
+    }
+    else
+    {
+        status = "ERR";
+        reason = failed > 0 ? "FAILED" : "NO_ELIGIBLE";
+    }
+
+    SendCreatorInitAutoResultPacket(
+        requester, replyType, requestToken, "GROUP",
+        status, reason, total, initialized, skipped, failed);
+}
+// MB_CREATOR_INIT_AUTO_V1_END
 // MB_BOT_GROUP_LIFECYCLE_V1_BEGIN
 void SendBotGroupLifecycleResultPacket(
     Player* requester,
@@ -14025,6 +14306,61 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         RunCreatorAddClassCommand(
             player, replyType, fields[1], className, gender);
+        return true;
+    }
+    if (requestType == "CREATOR_INIT_AUTO")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        std::string const mode = ToUpper(Trim(fields[2]));
+        if (fields[2] != mode || (mode != "TARGET" && mode != "GROUP"))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_MODE");
+
+        std::string targetName;
+        if (mode == "TARGET")
+        {
+            if (!TryUrlDecodeField(fields[3], targetName, kMaxBotNameLength, false)
+                || targetName != Trim(targetName))
+            {
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_TARGET");
+            }
+        }
+        else if (!fields[3].empty())
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+
+        if (!ConsumeCreatorInitAutoRateLimit(player))
+        {
+            SendCreatorInitAutoResultPacket(
+                player, replyType, fields[1], mode,
+                "ERR", "RATE_LIMIT", 0, 0, 0, 0);
+            return true;
+        }
+
+        if (!RegisterBotLifecycleMutationToken(player, fields[1]))
+        {
+            SendCreatorInitAutoResultPacket(
+                player, replyType, fields[1], mode,
+                "ERR", "REPLAY", 0, 0, 0, 0);
+            return true;
+        }
+
+        if (mode == "TARGET")
+            RunCreatorInitAutoTarget(player, replyType, fields[1], targetName);
+        else
+            RunCreatorInitAutoGroup(player, replyType, fields[1]);
+
         return true;
     }
     if (requestType == "BOT_GROUP_LIFECYCLE")
