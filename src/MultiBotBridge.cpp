@@ -230,6 +230,7 @@ char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
 char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
+char const* const kGroupActionCapability = "GROUP_ACTION_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -289,6 +290,7 @@ void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string con
 void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
 void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
+void RunGroupActionCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& actionValue);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -370,7 +372,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
 kFollowOrderCapability,
 kStayOrderCapability,
 kAttackOrderCapability,
-kFleeOrderCapability
+kFleeOrderCapability,
+kGroupActionCapability
     };
 
     std::vector<std::string> chunks;
@@ -9305,6 +9308,171 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
 }
 // MB_FOLLOW_STAY_ORDER_V1_END
 
+// MB_GROUP_ACTION_V1_BEGIN
+bool IsAllowedGroupAction(std::string const& action)
+{
+    return action == "DRINK" ||
+        action == "RELEASE" ||
+        action == "REVIVE" ||
+        action == "SUMMON";
+}
+
+std::string GetNativeGroupActionName(std::string const& action)
+{
+    if (action == "DRINK")
+        return "drink";
+    if (action == "RELEASE")
+        return "release";
+    if (action == "REVIVE")
+        return "spirit healer";
+    if (action == "SUMMON")
+        return "summon";
+
+    return "";
+}
+
+bool ApplyNativeGroupAction(
+    Player* requester,
+    Player* bot,
+    std::string const& nativeActionName)
+{
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld() || nativeActionName.empty())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    return botAI->DoSpecificAction(
+        nativeActionName,
+        Event(nativeActionName, "", requester),
+        true);
+}
+
+void SendGroupActionAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& action,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << action
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(requester, replyType, "GROUP_ACTION_ACK", payload.str());
+}
+
+void RunGroupActionCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& actionValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (actionValue != action || !IsAllowedGroupAction(action))
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "BAD_ACTION");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    std::string const nativeActionName = GetNativeGroupActionName(action);
+    if (nativeActionName.empty())
+    {
+        SendGroupActionAck(
+            requester, replyType, token, action, 0, 0, 0, "BAD_ACTION");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        if (ApplyNativeGroupAction(requester, bot, nativeActionName))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendGroupActionAck(
+        requester,
+        replyType,
+        token,
+        action,
+        matched,
+        succeeded,
+        failed,
+        reason);
+}
+// MB_GROUP_ACTION_V1_END
 // MB_ATTACK_ORDER_V1_BEGIN
 class BridgeAttackAction final : public AttackAction
 {
@@ -15324,6 +15492,30 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
     }
     // MB_FOLLOW_STAY_ORDER_V1_DISPATCH_END
 
+    // MB_GROUP_ACTION_V1_DISPATCH_BEGIN
+    if (requestType == "GROUP_ACTION")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 3)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const action = ToUpper(Trim(fields[2]));
+        if (fields[2] != action || !IsAllowedGroupAction(action))
+        {
+            SendGroupActionAck(
+                player, replyType, fields[1], action, 0, 0, 0, "BAD_ACTION");
+            return true;
+        }
+
+        RunGroupActionCommand(player, replyType, fields[1], action);
+        return true;
+    }
+    // MB_GROUP_ACTION_V1_DISPATCH_END
 // MB_ATTACK_ORDER_V1_DISPATCH_BEGIN
 if (requestType == "ATTACK_ORDER")
 {

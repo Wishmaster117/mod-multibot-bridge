@@ -75,7 +75,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
 | **Quests** | Structured quest data and bot quest abandon. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
-| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1` and `FLEE_ORDER_V1` collective group-order endpoints. |
+| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1` and bounded `GROUP_ACTION_V1` endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
 | **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook and related data. |
 | **Outfits** | Structured outfit listing and actions. |
@@ -232,6 +232,31 @@ Runtime validation on **11 September 2026** confirmed ALL, controlled TARGET, no
 
 ---
 
+# Structured Group Actions
+
+The bounded Group Actions family uses the dedicated capability:
+
+```text
+GROUP_ACTION_V1
+```
+
+Only four semantic actions are accepted:
+
+```text
+DRINK   -> "drink"
+RELEASE -> "release"
+REVIVE  -> "spirit healer"
+SUMMON  -> "summon"
+```
+
+The addon does not provide a raw Playerbots command string. The Bridge validates the action against this closed allowlist, revalidates requester/group/bot state and Playerbots security, and reuses the existing group-order rate-limit, replay and 40-bot scope protections before invoking the audited native Playerbots action with `DoSpecificAction(...)`.
+
+Runtime validation on **11 September 2026** confirmed all four actions, including the Release-to-ghost then Revive-at-spirit-healer flow. Structured `GROUP_ACTION_ACK` responses were observed and no automatic PARTY/RAID legacy command transport was observed with the normal fallback policy disabled.
+
+`mod-playerbots` remains strictly read-only.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -297,6 +322,8 @@ BOT_GROUP_LIFECYCLE_V1
 FOLLOW_ORDER_V1
 STAY_ORDER_V1
 ATTACK_ORDER_V1
+FLEE_ORDER_V1
+GROUP_ACTION_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -347,7 +374,7 @@ The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *
 
 Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The next active migration is the bounded Group Actions set `drink`, `release`, `revive` and `summon`, followed by RTSC, quest interactions, remaining ordinary-bot actions and final legacy parser/fallback cleanup.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is now migrated and runtime validated through `GROUP_ACTION_V1`. The next active migration is RTSC, followed by quest interactions, remaining ordinary-bot actions and final legacy parser/fallback cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
