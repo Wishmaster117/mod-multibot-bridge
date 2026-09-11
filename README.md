@@ -75,7 +75,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
 | **Quests** | Structured quest data and bot quest abandon. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
-| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1` and `ATTACK_ORDER_V1` collective group-order endpoints. |
+| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1` and `FLEE_ORDER_V1` collective group-order endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
 | **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook and related data. |
 | **Outfits** | Structured outfit listing and actions. |
@@ -183,6 +183,7 @@ Advertised capabilities:
 FOLLOW_ORDER_V1
 STAY_ORDER_V1
 ATTACK_ORDER_V1
+FLEE_ORDER_V1
 ```
 
 Follow and Stay reuse the audited Playerbots shortcut actions directly without routing through `HandleCommand()`. Attack uses a Bridge-local adapter over `AttackAction::Attack(Unit*)`, because the stock `AttackMyTargetAction` resolves the target from the bot master rather than from the requesting player.
@@ -201,6 +202,33 @@ RANGED -> IsRanged(bot)
 The Attack target is resolved server-side from `requester->GetTarget()`. Group scope, per-bot security, rate limiting, replay protection and bounded bot counts are enforced on the Bridge. ACKs are returned through structured addon messages.
 
 No generic `RUN~ORDER` endpoint is exposed.
+
+---
+
+# Structured Flee Order
+
+Flee uses the dedicated capability:
+
+```text
+FLEE_ORDER_V1
+```
+
+Supported audiences are `ALL`, `TARGET`, `TANK`, `HEALER`, `DPS`, `MELEE` and `RANGED`.
+
+The Bridge invokes the audited Playerbots `flee chat shortcut` action rather than duplicating its strategy reset, follow/stay/passive changes or movement semantics. Role selection stays authoritative on the server through the same audited role predicates used by the Bridge (`BotMatchesAttackAudience`).
+
+For role-scoped requests, the Bridge emits one bounded result item per matched bot before the final aggregate ACK:
+
+```text
+FLEE_ORDER_ITEM~token~audience~encodedBotName~OK|ERR
+FLEE_ORDER_ACK~token~audience~matched~succeeded~failed~reason
+```
+
+`FLEE_ORDER_ITEM` uses the existing state-packet wire-budget guard, the matched-bot scope remains capped at 40, and the final ACK schema remains compatible. If the addon cannot assemble a complete authoritative role-name set, it falls back to count feedback instead of displaying an incomplete list.
+
+Requester/session validation, group scope, per-bot Playerbots security, rate limiting and replay protection remain server-side. The Bridge still exposes no generic Playerbots command executor.
+
+Runtime validation on **11 September 2026** confirmed ALL, controlled TARGET, non-bot TARGET rejection, all role audiences, authoritative bot-name feedback and no normal Flee success-whisper spam on the chatless path.
 
 ---
 
@@ -311,11 +339,15 @@ The Bridge is the primary adaptation layer for the MultiBot Chatless project and
 
 The project is intentionally described as **bridge-first / mostly chatless** until all remaining automatic legacy chat paths have been audited and either migrated, intentionally retained or removed.
 
-Collective **Follow**, **Stay** and **Attack** are now implemented through dedicated structured Bridge endpoints and runtime validated. Their technical ACKs no longer depend on automatic chat transport or parsing, and the Bridge still exposes no generic Playerbots command executor.
+Collective **Follow**, **Stay** and **Attack** are implemented through dedicated structured Bridge endpoints and runtime validated. Their technical ACKs no longer depend on automatic chat transport or parsing, and the Bridge still exposes no generic Playerbots command executor.
 
-The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` is now migrated through `BOT_GROUP_LIFECYCLE_V1`. Runtime validation confirmed structured disconnect/reconnect of grouped Playerbots without forcing group-slot removal, while the actual login/logout operations remain delegated to Playerbots.
+**Flee** is now also implemented and runtime validated through `FLEE_ORDER_V1`. The Bridge remains authoritative for Tank / Healer / DPS / Melee / Ranged matching and returns per-bot `FLEE_ORDER_ITEM` results before the aggregate ACK so the addon can display the exact selected bot names without reproducing role logic client-side.
 
-Creator `addclass` is now migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. `init=auto` remains the next Creator/init sub-path; obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
+The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` is migrated through `BOT_GROUP_LIFECYCLE_V1`. Runtime validation confirmed structured disconnect/reconnect of grouped Playerbots without forcing group-slot removal, while the actual login/logout operations remain delegated to Playerbots.
+
+Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
+
+The next active migration is the bounded Group Actions set `drink`, `release`, `revive` and `summon`, followed by RTSC, quest interactions, remaining ordinary-bot actions and final legacy parser/fallback cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 

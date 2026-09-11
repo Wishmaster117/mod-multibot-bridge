@@ -229,6 +229,7 @@ char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
 char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
+char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -287,6 +288,7 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
 void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
+void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -367,7 +369,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kBotTargetResolveCapability,
 kFollowOrderCapability,
 kStayOrderCapability,
-kAttackOrderCapability
+kAttackOrderCapability,
+kFleeOrderCapability
     };
 
     std::vector<std::string> chunks;
@@ -13172,6 +13175,180 @@ void RunBotTargetResolveRequest(
 // MB_BOT_TARGET_RESOLVE_V1_END
 // MB_BOT_LIFECYCLE_V1_END
 
+// MB_FLEE_ORDER_V1_BEGIN
+bool ApplyNativeFleeOrder(Player* requester, Player* bot)
+{
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    return botAI->DoSpecificAction(
+        "flee chat shortcut",
+        Event("flee chat shortcut", "", requester),
+        true);
+}
+
+void SendFleeOrderAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& audience,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << audience
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "FLEE_ORDER_ACK", payload.str());
+}
+
+// MB_FLEE_ROLE_NAMES_AUTHORITATIVE_V1_BEGIN
+bool SendFleeOrderItem(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& audience,
+    std::string const& botName,
+    bool applied)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << audience
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << (applied ? "OK" : "ERR");
+
+    return SendStateAddonPacket(requester, replyType, "FLEE_ORDER_ITEM", payload.str());
+}
+// MB_FLEE_ROLE_NAMES_AUTHORITATIVE_V1_END
+
+void RunFleeOrderCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& audienceValue,
+    std::string const& targetName)
+{
+    std::string const audience = ToUpper(Trim(audienceValue));
+
+    if (audience == "TARGET")
+    {
+        PlayerbotMgr* const mgr = requester ? sPlayerbotsMgr.GetPlayerbotMgr(requester) : nullptr;
+        if (!mgr)
+        {
+            SendFleeOrderAck(requester, replyType, requestToken, audience, 0, 0, 0, "FAILED");
+            return;
+        }
+
+        ObjectGuid targetGuid;
+        CharacterCacheEntry const* target = nullptr;
+        if (!ResolveBotLifecycleTargetByName(requester, targetName, targetGuid, target))
+        {
+            SendFleeOrderAck(requester, replyType, requestToken, audience, 0, 0, 0, "NOT_ALLOWED");
+            return;
+        }
+
+        Player* const bot = mgr->GetPlayerBot(targetGuid);
+        if (!bot)
+        {
+            SendFleeOrderAck(requester, replyType, requestToken, audience, 0, 0, 0, "NOT_CONTROLLED");
+            return;
+        }
+
+        bool const applied = ApplyNativeFleeOrder(requester, bot);
+        SendFleeOrderAck(
+            requester,
+            replyType,
+            requestToken,
+            audience,
+            1,
+            applied ? 1 : 0,
+            applied ? 0 : 1,
+            applied ? "OK" : "FAILED");
+        return;
+    }
+
+    Group* const requesterGroup = requester ? requester->GetGroup() : nullptr;
+    if (!requesterGroup)
+    {
+        SendFleeOrderAck(requester, replyType, requestToken, audience, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!BotMatchesAttackAudience(botAI, bot, audience))
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        bool const applied = ApplyNativeFleeOrder(requester, bot);
+        if (applied)
+            ++succeeded;
+        else
+            ++failed;
+
+        if (audience != "ALL")
+            SendFleeOrderItem(
+                requester,
+                replyType,
+                requestToken,
+                audience,
+                bot->GetName(),
+                applied);
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendFleeOrderAck(
+        requester,
+        replyType,
+        requestToken,
+        audience,
+        matched,
+        succeeded,
+        failed,
+        reason);
+}
+// MB_FLEE_ORDER_V1_END
+
 std::string BuildRosterPayload(Player* player)
 {
     std::ostringstream out;
@@ -14363,6 +14540,59 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         return true;
     }
+    if (requestType == "FLEE_ORDER")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const audience = ToUpper(Trim(fields[2]));
+        bool const audienceValid =
+            audience == "TARGET" || IsAllowedAttackAudience(audience);
+        if (fields[2] != audience || !audienceValid)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_AUDIENCE");
+
+        std::string targetName;
+        if (audience == "TARGET")
+        {
+            if (!TryUrlDecodeField(fields[3], targetName, kMaxBotNameLength, false) ||
+                targetName != Trim(targetName))
+            {
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_TARGET");
+            }
+        }
+        else if (!fields[3].empty())
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+
+        if (!ConsumeGroupOrderRateLimit(player))
+        {
+            SendFleeOrderAck(
+                player, replyType, fields[1], audience, 0, 0, 0, "RATE_LIMIT");
+            return true;
+        }
+
+        if (!RegisterGroupOrderToken(player, fields[1]))
+        {
+            SendFleeOrderAck(
+                player, replyType, fields[1], audience, 0, 0, 0, "REPLAY");
+            return true;
+        }
+
+        RunFleeOrderCommand(
+            player, replyType, fields[1], audience, targetName);
+        return true;
+    }
+
     if (requestType == "BOT_GROUP_LIFECYCLE")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
