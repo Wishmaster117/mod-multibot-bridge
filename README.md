@@ -75,7 +75,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
 | **Quests** | Structured quest data and bot quest abandon. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
-| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1` and bounded `GROUP_ACTION_V1` endpoints. |
+| **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1`, bounded `GROUP_ACTION_V1` and `RTSC_ORDER_V1` endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
 | **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook and related data. |
 | **Outfits** | Structured outfit listing and actions. |
@@ -257,6 +257,30 @@ Runtime validation on **11 September 2026** confirmed all four actions, includin
 
 ---
 
+# Structured RTSC Order
+
+RTSC uses the dedicated capability:
+
+```text
+RTSC_ORDER_V1
+```
+
+The endpoint accepts only the bounded semantic operations `ENABLE`, `RESET`, `SELECT`, `CANCEL`, `SAVE`, `UNSAVE` and `GO`. Audiences are `ALL`, `TANK`, `HEALER`, `DPS`, `MELEE`, `RANGED`, `MELEE_DPS`, `RANGED_DPS` and `GROUPS`; group masks and saved-slot values are validated server-side.
+
+The Bridge adapts these requests to the audited native Playerbots RTSC action with:
+
+```cpp
+botAI->DoSpecificAction("rtsc", Event("rtsc", nativeParam, requester), true);
+```
+
+It does not accept raw coordinates, does not synthesize `SpellCastTargets`, and does not reimplement the AEDM cast/movement pipeline. `/cast aedm` remains a native WoW spell cast handled by Playerbots.
+
+The RTSC path reuses the validated requester/group scope, per-bot Playerbots security, 40-bot bound, rate limiting and replay protection. Runtime validation on **12 September 2026** covered all role audiences, groups 1..5, multi-group selection, SAVE/GO/UNSAVE, CANCEL and native AEDM movement behavior.
+
+A post-RTSC warning cleanup re-exposes the AzerothCore base `OnPlayerCanUseChat` overload set with a `using` declaration and removes one definition-only guild-bank helper. Windows build and runtime smoke tests passed; disappearance of the corresponding GCC warnings remains to be confirmed on the next Linux build of this branch.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -324,6 +348,7 @@ STAY_ORDER_V1
 ATTACK_ORDER_V1
 FLEE_ORDER_V1
 GROUP_ACTION_V1
+RTSC_ORDER_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -374,7 +399,7 @@ The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *
 
 Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The bounded Group Actions set `drink`, `release`, `revive` and `summon` is now migrated and runtime validated through `GROUP_ACTION_V1`. The next active migration is RTSC, followed by quest interactions, remaining ordinary-bot actions and final legacy parser/fallback cleanup.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is now also migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The next active migration is Quest interactions, followed by remaining ordinary-bot actions and final legacy parser/fallback cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 

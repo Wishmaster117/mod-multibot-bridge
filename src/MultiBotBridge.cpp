@@ -231,6 +231,7 @@ char const* const kStayOrderCapability = "STAY_ORDER_V1";
 char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
 char const* const kGroupActionCapability = "GROUP_ACTION_V1";
+char const* const kRtscOrderCapability = "RTSC_ORDER_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -373,7 +374,8 @@ kFollowOrderCapability,
 kStayOrderCapability,
 kAttackOrderCapability,
 kFleeOrderCapability,
-kGroupActionCapability
+kGroupActionCapability,
+kRtscOrderCapability
     };
 
     std::vector<std::string> chunks;
@@ -4206,21 +4208,6 @@ int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* player, uint8 tabId
     return remaining > 0 ? int32(std::min<int64>(remaining, std::numeric_limits<int32>::max())) : 0;
 }
 
-int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* player)
-{
-    int32 bestRemaining = 0;
-    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
-    {
-        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, player, tabId);
-        if (remaining == std::numeric_limits<int32>::max())
-            return remaining;
-
-        if (remaining > bestRemaining)
-            bestRemaining = remaining;
-    }
-
-    return bestRemaining;
-}
 
 int32 GetEffectiveGuildBankWithdrawRemaining(Guild* guild, Player* requester, Player* bot)
 {
@@ -9473,6 +9460,382 @@ void RunGroupActionCommand(
         reason);
 }
 // MB_GROUP_ACTION_V1_END
+// MB_RTSC_ORDER_V1_BEGIN
+bool ParseRtscUnsigned(std::string const& value, uint32 maximum, uint32& parsed)
+{
+    if (value.empty())
+        return false;
+
+    uint32 current = 0;
+    for (char const ch : value)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+
+        uint32 const digit = static_cast<uint32>(ch - '0');
+        if (current > (maximum - digit) / 10)
+            return false;
+
+        current = current * 10 + digit;
+        if (current > maximum)
+            return false;
+    }
+
+    parsed = current;
+    return true;
+}
+
+bool IsAllowedRtscOperation(std::string const& operation)
+{
+    return operation == "ENABLE" ||
+        operation == "RESET" ||
+        operation == "SELECT" ||
+        operation == "CANCEL" ||
+        operation == "SAVE" ||
+        operation == "UNSAVE" ||
+        operation == "GO";
+}
+
+bool IsAllowedRtscAudience(std::string const& audience)
+{
+    return audience == "ALL" ||
+        audience == "TANK" ||
+        audience == "HEALER" ||
+        audience == "DPS" ||
+        audience == "MELEE" ||
+        audience == "RANGED" ||
+        audience == "MELEE_DPS" ||
+        audience == "RANGED_DPS" ||
+        audience == "GROUPS";
+}
+
+std::string ValidateRtscShape(
+    std::string const& operation,
+    std::string const& audience,
+    uint32 groupMask,
+    uint32 slot)
+{
+    if (!IsAllowedRtscOperation(operation))
+        return "BAD_OP";
+    if (!IsAllowedRtscAudience(audience))
+        return "BAD_AUDIENCE";
+
+    bool const targeted = operation == "SELECT" || operation == "GO";
+    if (targeted)
+    {
+        if (audience == "GROUPS")
+        {
+            if (groupMask < 1 || groupMask > 31)
+                return "BAD_GROUP_MASK";
+        }
+        else if (groupMask != 0)
+        {
+            return "BAD_GROUP_MASK";
+        }
+    }
+    else
+    {
+        if (audience != "ALL")
+            return "BAD_COMBINATION";
+        if (groupMask != 0)
+            return "BAD_GROUP_MASK";
+    }
+
+    bool const slotRequired =
+        operation == "SAVE" || operation == "UNSAVE" || operation == "GO";
+
+    if (slotRequired)
+    {
+        if (slot < 1 || slot > 9)
+            return "BAD_SLOT";
+    }
+    else if (slot != 0)
+    {
+        return "BAD_SLOT";
+    }
+
+    return "";
+}
+
+bool BotMatchesRtscAudience(
+    PlayerbotAI* botAI,
+    Player* bot,
+    std::string const& audience,
+    uint32 groupMask)
+{
+    if (!botAI || !bot)
+        return false;
+
+    if (audience == "ALL")
+        return true;
+    if (audience == "TANK")
+        return botAI->IsTank(bot);
+    if (audience == "HEALER")
+        return botAI->IsHeal(bot);
+    if (audience == "DPS")
+        return !botAI->IsTank(bot) && !botAI->IsHeal(bot);
+    if (audience == "RANGED")
+        return botAI->IsRanged(bot);
+    if (audience == "MELEE")
+        return !botAI->IsRanged(bot);
+    if (audience == "RANGED_DPS")
+        return botAI->IsRanged(bot) && !botAI->IsTank(bot) && !botAI->IsHeal(bot);
+    if (audience == "MELEE_DPS")
+        return botAI->IsMelee(bot) && !botAI->IsTank(bot) && !botAI->IsHeal(bot);
+
+    if (audience == "GROUPS")
+    {
+        uint32 const subgroupIndex = bot->GetSubGroup();
+        if (subgroupIndex >= 5)
+            return false;
+
+        uint32 const subgroupBit = 1u << subgroupIndex;
+        return (groupMask & subgroupBit) != 0;
+    }
+
+    return false;
+}
+
+std::string GetNativeRtscParam(std::string const& operation, uint32 slot)
+{
+    if (operation == "ENABLE")
+        return "";
+    if (operation == "RESET")
+        return "reset";
+    if (operation == "SELECT")
+        return "select";
+    if (operation == "CANCEL")
+        return "cancel";
+    if (operation == "SAVE")
+        return "save " + std::to_string(slot);
+    if (operation == "UNSAVE")
+        return "unsave " + std::to_string(slot);
+    if (operation == "GO")
+        return "go " + std::to_string(slot);
+
+    return "";
+}
+
+bool ApplyNativeRtscOrder(
+    Player* requester,
+    Player* bot,
+    std::string const& operation,
+    uint32 slot)
+{
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    if (operation == "ENABLE")
+    {
+        uint32 constexpr rtscMoveSpell = 30758;
+        if (requester->HasSpell(rtscMoveSpell))
+            return true;
+
+        botAI->DoSpecificAction(
+            "rtsc",
+            Event("rtsc", "", requester),
+            true);
+
+        return requester->HasSpell(rtscMoveSpell);
+    }
+
+    std::string const nativeParam = GetNativeRtscParam(operation, slot);
+    bool const executed = botAI->DoSpecificAction(
+        "rtsc",
+        Event("rtsc", nativeParam, requester),
+        true);
+
+    if (executed)
+        return true;
+
+    if (operation == "SELECT")
+    {
+        AiObjectContext* const context = botAI->GetAiObjectContext();
+        return context && context->GetValue<bool>("RTSC selected")->Get();
+    }
+
+    return false;
+}
+
+void SendRtscOrderAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& operation,
+    std::string const& audience,
+    uint32 groupMask,
+    uint32 slot,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << operation
+        << kFieldSeparator << audience
+        << kFieldSeparator << groupMask
+        << kFieldSeparator << slot
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(requester, replyType, "RTSC_ORDER_ACK", payload.str());
+}
+
+void RunRtscOrderCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& operationValue,
+    std::string const& audienceValue,
+    std::string const& groupMaskValue,
+    std::string const& slotValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const operation = ToUpper(Trim(operationValue));
+    std::string const audience = ToUpper(Trim(audienceValue));
+
+    uint32 groupMask = 0;
+    uint32 slot = 0;
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (operationValue != operation || !IsAllowedRtscOperation(operation))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "BAD_OP");
+        return;
+    }
+
+    if (audienceValue != audience || !IsAllowedRtscAudience(audience))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "BAD_AUDIENCE");
+        return;
+    }
+
+    if (!ParseRtscUnsigned(groupMaskValue, 31, groupMask))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, 0, slot,
+            0, 0, 0, "BAD_GROUP_MASK");
+        return;
+    }
+
+    if (!ParseRtscUnsigned(slotValue, 9, slot))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, 0,
+            0, 0, 0, "BAD_SLOT");
+        return;
+    }
+
+    std::string const shapeReason =
+        ValidateRtscShape(operation, audience, groupMask, slot);
+    if (!shapeReason.empty())
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, shapeReason);
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendRtscOrderAck(
+            requester, replyType, token, operation, audience, groupMask, slot,
+            0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!BotMatchesRtscAudience(botAI, bot, audience, groupMask))
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        if (ApplyNativeRtscOrder(requester, bot, operation, slot))
+            ++succeeded;
+        else
+            ++failed;
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendRtscOrderAck(
+        requester,
+        replyType,
+        token,
+        operation,
+        audience,
+        groupMask,
+        slot,
+        matched,
+        succeeded,
+        failed,
+        reason);
+}
+// MB_RTSC_ORDER_V1_END
 // MB_ATTACK_ORDER_V1_BEGIN
 class BridgeAttackAction final : public AttackAction
 {
@@ -15516,6 +15879,25 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
     // MB_GROUP_ACTION_V1_DISPATCH_END
+    // MB_RTSC_ORDER_V1_DISPATCH_BEGIN
+    if (requestType == "RTSC_ORDER")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 6)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        RunRtscOrderCommand(
+            player,
+            replyType,
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5]);
+        return true;
+    }
+    // MB_RTSC_ORDER_V1_DISPATCH_END
 // MB_ATTACK_ORDER_V1_DISPATCH_BEGIN
 if (requestType == "ATTACK_ORDER")
 {
@@ -15609,6 +15991,7 @@ class MultiBotBridgePlayerScript final : public PlayerScript
 {
 public:
     MultiBotBridgePlayerScript() : PlayerScript("MultiBotBridgePlayerScript") {}
+    using PlayerScript::OnPlayerCanUseChat;
 
     bool TryHandle(Player* player, uint32 type, uint32 lang, std::string& msg)
     {
