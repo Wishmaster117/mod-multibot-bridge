@@ -232,6 +232,11 @@ char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
 char const* const kGroupActionCapability = "GROUP_ACTION_V1";
 char const* const kRtscOrderCapability = "RTSC_ORDER_V1";
+char const* const kQuestAcceptAllCapability = "QUEST_ACCEPT_ALL_V1";
+char const* const kQuestTalkCapability = "QUEST_TALK_V1";
+char const* const kQuestGameObjectUseCapability = "QUEST_GAMEOBJECT_USE_V1";
+char const* const kQuestRewardCapability = "QUEST_REWARD_V1";
+char const* const kQuestRewardPolicyCapability = "QUEST_REWARD_POLICY_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -292,6 +297,7 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
 void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
 void RunGroupActionCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& actionValue);
+void RunQuestAcceptAllCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -375,7 +381,12 @@ kStayOrderCapability,
 kAttackOrderCapability,
 kFleeOrderCapability,
 kGroupActionCapability,
-kRtscOrderCapability
+kRtscOrderCapability,
+kQuestAcceptAllCapability,
+        kQuestTalkCapability,
+        kQuestGameObjectUseCapability,
+        kQuestRewardCapability,
+        kQuestRewardPolicyCapability
     };
 
     std::vector<std::string> chunks;
@@ -404,6 +415,11 @@ kRtscOrderCapability
     for (std::string const& capabilityChunk : chunks)
         SendAddonPacket(player, chatType, "CAPS", capabilityChunk);
     SendAddonPacket(player, chatType, "CAPS_END");
+    SendAddonPacket(
+        player,
+        chatType,
+        "QUEST_REWARD_POLICY",
+        sPlayerbotAIConfig.autoPickReward == "yes" ? "AUTO" : "MANUAL");
     return true;
 }
 
@@ -9460,6 +9476,909 @@ void RunGroupActionCommand(
         reason);
 }
 // MB_GROUP_ACTION_V1_END
+// MB_QUEST_ACCEPT_ALL_V1_BEGIN
+std::set<uint32> CaptureQuestLogIds(Player* bot)
+{
+    std::set<uint32> questIds;
+    if (!bot)
+        return questIds;
+
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 const questId = bot->GetQuestSlotQuestId(slot);
+        if (questId)
+            questIds.insert(questId);
+    }
+
+    return questIds;
+}
+
+bool ApplyNativeQuestAcceptAll(
+    Player* requester,
+    Player* bot,
+    uint32& accepted)
+{
+    accepted = 0;
+
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(
+            PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    std::set<uint32> const beforeQuestIds = CaptureQuestLogIds(bot);
+
+    // The audited Playerbots "accept *" path is AcceptQuestAction with
+    // Event("accept", "*", requester). Its bool return is false on the
+    // wildcard path even when quests were accepted, so result measurement
+    // must use the quest-log delta instead of DoSpecificAction's return value.
+    std::string const addonFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#a ";
+    std::string const normalFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#w ";
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, addonFeedbackRoute, requester);
+
+    botAI->DoSpecificAction(
+        "accept quest",
+        Event("accept", "*", requester),
+        true);
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, normalFeedbackRoute, requester);
+
+    std::set<uint32> const afterQuestIds = CaptureQuestLogIds(bot);
+    for (uint32 const questId : afterQuestIds)
+    {
+        if (beforeQuestIds.find(questId) == beforeQuestIds.end())
+            ++accepted;
+    }
+
+    return true;
+}
+
+void SendQuestAcceptAllAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    uint32 matched,
+    uint32 processed,
+    uint32 accepted,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << matched
+        << kFieldSeparator << processed
+        << kFieldSeparator << accepted
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(
+        requester, replyType, "QUEST_ACCEPT_ALL_ACK", payload.str());
+}
+
+void RunQuestAcceptAllCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken)
+{
+    std::string const token = Trim(requestToken);
+
+    if (!requester || !IsValidRequestToken(token))
+    {
+        SendQuestAcceptAllAck(
+            requester, replyType, token, 0, 0, 0, "BAD_TOKEN");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendQuestAcceptAllAck(
+            requester, replyType, token, 0, 0, 0, "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendQuestAcceptAllAck(
+            requester, replyType, token, 0, 0, 0, "REPLAY");
+        return;
+    }
+
+    Group* const requesterGroup = requester->GetGroup();
+    if (!requesterGroup)
+    {
+        SendQuestAcceptAllAck(
+            requester, replyType, token, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 processed = 0;
+    uint32 accepted = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+
+        uint32 acceptedByBot = 0;
+        if (ApplyNativeQuestAcceptAll(requester, bot, acceptedByBot))
+        {
+            ++processed;
+            accepted += acceptedByBot;
+        }
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (processed == matched)
+        reason = "OK";
+    else if (processed > 0)
+        reason = "PARTIAL";
+    else
+        reason = "FAILED";
+
+    SendQuestAcceptAllAck(
+        requester,
+        replyType,
+        token,
+        matched,
+        processed,
+        accepted,
+        reason);
+}
+// MB_QUEST_ACCEPT_ALL_V1_END
+// MB_QUEST_TALK_V1_BEGIN
+
+void SendQuestTalkAck(
+
+    Player* requester,
+
+    ChatMsg replyType,
+
+    std::string const& requestToken,
+
+    uint32 matched,
+
+    uint32 processed,
+
+    uint32 interacted,
+
+    std::string const& reason)
+
+{
+
+    std::ostringstream payload;
+
+    payload << requestToken
+
+        << kFieldSeparator << matched
+
+        << kFieldSeparator << processed
+
+        << kFieldSeparator << interacted
+
+        << kFieldSeparator << reason;
+
+
+
+    SendAddonPacket(
+
+        requester, replyType, "QUEST_TALK_ACK", payload.str());
+
+}
+
+
+
+bool ApplyNativeQuestTalk(Player* requester, Player* bot)
+
+{
+
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+
+        !requester->IsInWorld() || !bot->IsInWorld())
+
+    {
+
+        return false;
+
+    }
+
+
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+
+    if (!botAI || !botAI->GetSecurity() ||
+
+        !botAI->GetSecurity()->CheckLevelFor(
+
+            PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+
+    {
+
+        return false;
+
+    }
+
+
+
+    // Playerbots-native feedback routing:
+
+    // "#a " arms currentChat=CHAT_MSG_ADDON with an empty command, so
+
+    // TellMaster/TellMasterNoFacing feedback is delivered as LANG_ADDON
+
+    // instead of CHAT_MSG_WHISPER. "#w " restores the normal route after
+
+    // both synchronous native actions complete.
+
+    botAI->HandleCommand(CHAT_MSG_PARTY, "#a ", requester);
+
+
+
+    bool const gossipInteracted = botAI->DoSpecificAction(
+
+        "gossip hello",
+
+        Event("talk", "", requester),
+
+        true);
+
+
+
+    bool const questInteracted = botAI->DoSpecificAction(
+
+        "talk to quest giver",
+
+        Event("talk", "", requester),
+
+        true);
+
+
+
+    botAI->HandleCommand(CHAT_MSG_PARTY, "#w ", requester);
+
+
+
+    return gossipInteracted || questInteracted;
+
+}
+
+
+
+void RunQuestTalkCommand(
+
+    Player* requester,
+
+    ChatMsg replyType,
+
+    std::string const& requestToken)
+
+{
+
+    std::string const token = Trim(requestToken);
+
+
+
+    if (!requester || !requester->GetSession() || !requester->IsInWorld() ||
+
+        !IsValidRequestToken(token))
+
+    {
+
+        SendQuestTalkAck(
+
+            requester, replyType, token, 0, 0, 0, "BAD_TOKEN");
+
+        return;
+
+    }
+
+
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+
+    {
+
+        SendQuestTalkAck(
+
+            requester, replyType, token, 0, 0, 0, "RATE_LIMIT");
+
+        return;
+
+    }
+
+
+
+    if (!RegisterGroupOrderToken(requester, token))
+
+    {
+
+        SendQuestTalkAck(
+
+            requester, replyType, token, 0, 0, 0, "REPLAY");
+
+        return;
+
+    }
+
+
+
+    Group* const requesterGroup = requester->GetGroup();
+
+    if (!requesterGroup)
+
+    {
+
+        SendQuestTalkAck(
+
+            requester, replyType, token, 0, 0, 0, "NO_GROUP");
+
+        return;
+
+    }
+
+
+
+    uint32 matched = 0;
+
+    uint32 processed = 0;
+
+    uint32 interacted = 0;
+
+    bool botLimitExceeded = false;
+
+
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+
+    {
+
+        if (!bot || bot->GetGroup() != requesterGroup)
+
+            continue;
+
+
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+
+        {
+
+            botLimitExceeded = true;
+
+            break;
+
+        }
+
+
+
+        ++matched;
+
+        ++processed;
+
+
+
+        if (ApplyNativeQuestTalk(requester, bot))
+
+            ++interacted;
+
+    }
+
+
+
+    std::string reason = "OK";
+
+    if (botLimitExceeded)
+
+        reason = "BOT_LIMIT";
+
+    else if (matched == 0)
+
+        reason = "NO_BOTS";
+
+    else if (interacted == 0)
+
+        reason = "FAILED";
+
+    else if (interacted < processed)
+
+        reason = "PARTIAL";
+
+
+
+    SendQuestTalkAck(
+
+        requester,
+
+        replyType,
+
+        token,
+
+        matched,
+
+        processed,
+
+        interacted,
+
+        reason);
+
+}
+
+// MB_QUEST_TALK_V1_END
+// MB_QUEST_GAMEOBJECT_USE_V1_BEGIN
+struct QuestGameObjectUseRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<uint32, QuestGameObjectUseRateState> sQuestGameObjectUseRateStates;
+
+void PruneQuestGameObjectUseRateState(
+    QuestGameObjectUseRateState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() &&
+           now - state.requests.front() >= kGroupOrderRateWindow)
+    {
+        state.requests.pop_front();
+    }
+
+    while (!state.recentTokens.empty() &&
+           now - state.recentTokens.front().second >= kGroupOrderReplayTtl)
+    {
+        state.recentTokens.pop_front();
+    }
+
+    while (state.recentTokens.size() > kGroupOrderMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeQuestGameObjectUseRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now =
+        std::chrono::steady_clock::now();
+    uint32 const key = requester->GetGUID().GetCounter();
+    QuestGameObjectUseRateState& state = sQuestGameObjectUseRateStates[key];
+
+    PruneQuestGameObjectUseRateState(state, now);
+    if (state.requests.size() >= kGroupOrderRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sQuestGameObjectUseRateStates.size() > kGroupOrderMaxRequesterStates)
+    {
+        for (auto it = sQuestGameObjectUseRateStates.begin();
+             it != sQuestGameObjectUseRateStates.end();)
+        {
+            PruneQuestGameObjectUseRateState(it->second, now);
+
+            if (it->first != key &&
+                it->second.requests.empty() &&
+                it->second.recentTokens.empty())
+            {
+                it = sQuestGameObjectUseRateStates.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool RegisterQuestGameObjectUseToken(
+    Player* requester,
+    std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now =
+        std::chrono::steady_clock::now();
+    uint32 const key = requester->GetGUID().GetCounter();
+    QuestGameObjectUseRateState& state = sQuestGameObjectUseRateStates[key];
+
+    PruneQuestGameObjectUseRateState(state, now);
+
+    for (auto const& recent : state.recentTokens)
+        if (recent.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kGroupOrderMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+void SendQuestGameObjectUseAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botName,
+    bool used,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+            << kFieldSeparator << UrlEncodeField(botName)
+            << kFieldSeparator << (used ? 1 : 0)
+            << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(
+        requester,
+        replyType,
+        "QUEST_GAMEOBJECT_USE_ACK",
+        payload.str());
+}
+
+bool ApplyNativeQuestGameObjectUse(
+    Player* requester,
+    Player* bot,
+    std::string const& gameObjectName)
+{
+    if (!requester || !bot || gameObjectName.empty() ||
+        !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(
+            PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    std::string const addonFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#a ";
+    std::string const normalFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#w ";
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, addonFeedbackRoute, requester);
+
+    bool const used = botAI->DoSpecificAction(
+        "use",
+        Event("use", gameObjectName, requester),
+        true);
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, normalFeedbackRoute, requester);
+
+    return used;
+}
+
+void RunQuestGameObjectUseCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botNameValue,
+    std::string const& gameObjectNameValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string const gameObjectName = Trim(gameObjectNameValue);
+
+    std::string effectiveBotName = requestedBotName;
+    std::string reason = "OK";
+    bool used = false;
+
+    if (!requester || !requester->GetSession() ||
+        !requester->IsInWorld() ||
+        !IsValidRequestToken(token) ||
+        requestedBotName.empty() ||
+        gameObjectName.empty())
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (!ConsumeQuestGameObjectUseRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!RegisterQuestGameObjectUseToken(requester, token))
+    {
+        reason = "DUPLICATE";
+    }
+    else
+    {
+        Player* const bot = FindBotByName(requester, requestedBotName);
+        if (!bot)
+        {
+            reason = "NO_BOT";
+        }
+        else
+        {
+            effectiveBotName = bot->GetName();
+
+            PlayerbotAI* const botAI = GetBotAI(bot);
+            if (!botAI || !botAI->GetSecurity() ||
+                !botAI->GetSecurity()->CheckLevelFor(
+                    PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            {
+                reason = "FORBIDDEN";
+            }
+            else if (!bot->GetSession() || !bot->IsInWorld())
+            {
+                reason = "NOT_READY";
+            }
+            else
+            {
+                used = ApplyNativeQuestGameObjectUse(
+                    requester, bot, gameObjectName);
+
+                if (!used)
+                    reason = "FAILED";
+            }
+        }
+    }
+
+    SendQuestGameObjectUseAck(
+        requester,
+        replyType,
+        token,
+        effectiveBotName,
+        used,
+        reason);
+}
+// MB_QUEST_GAMEOBJECT_USE_V1_END
+// MB_QUEST_REWARD_V1_BEGIN
+struct QuestRewardRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<uint32, QuestRewardRateState> sQuestRewardRateStates;
+
+void PruneQuestRewardRateState(
+    QuestRewardRateState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() &&
+           now - state.requests.front() >= kGroupOrderRateWindow)
+    {
+        state.requests.pop_front();
+    }
+
+    while (!state.recentTokens.empty() &&
+           now - state.recentTokens.front().second >= kGroupOrderReplayTtl)
+    {
+        state.recentTokens.pop_front();
+    }
+
+    while (state.recentTokens.size() > kGroupOrderMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeQuestRewardRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now =
+        std::chrono::steady_clock::now();
+    uint32 const key = requester->GetGUID().GetCounter();
+    QuestRewardRateState& state = sQuestRewardRateStates[key];
+
+    PruneQuestRewardRateState(state, now);
+    if (state.requests.size() >= kGroupOrderRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sQuestRewardRateStates.size() > kGroupOrderMaxRequesterStates)
+    {
+        for (auto it = sQuestRewardRateStates.begin();
+             it != sQuestRewardRateStates.end();)
+        {
+            PruneQuestRewardRateState(it->second, now);
+
+            if (it->first != key &&
+                it->second.requests.empty() &&
+                it->second.recentTokens.empty())
+            {
+                it = sQuestRewardRateStates.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool RegisterQuestRewardToken(
+    Player* requester,
+    std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now =
+        std::chrono::steady_clock::now();
+    uint32 const key = requester->GetGUID().GetCounter();
+    QuestRewardRateState& state = sQuestRewardRateStates[key];
+
+    PruneQuestRewardRateState(state, now);
+
+    for (auto const& recent : state.recentTokens)
+        if (recent.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kGroupOrderMaxRecentTokens)
+        state.recentTokens.pop_front();
+
+    return true;
+}
+
+void SendQuestRewardAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botName,
+    bool rewarded,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+            << kFieldSeparator << UrlEncodeField(botName)
+            << kFieldSeparator << (rewarded ? 1 : 0)
+            << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(
+        requester,
+        replyType,
+        "QUEST_REWARD_ACK",
+        payload.str());
+}
+
+bool ApplyNativeQuestReward(
+    Player* requester,
+    Player* bot,
+    std::string const& itemLink)
+{
+    if (!requester || !bot || itemLink.empty() ||
+        !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(
+            PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    std::string const addonFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#a ";
+    std::string const normalFeedbackRoute =
+        sPlayerbotAIConfig.commandPrefix + "#w ";
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, addonFeedbackRoute, requester);
+
+    bool const rewarded = botAI->DoSpecificAction(
+        "reward",
+        Event("reward", itemLink, requester),
+        true);
+
+    botAI->HandleCommand(
+        CHAT_MSG_PARTY, normalFeedbackRoute, requester);
+
+    return rewarded;
+}
+
+void RunQuestRewardCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botNameValue,
+    std::string const& itemLinkValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string const itemLink = Trim(itemLinkValue);
+
+    std::string effectiveBotName = requestedBotName;
+    std::string reason = "OK";
+    bool rewarded = false;
+
+    if (!requester || !requester->GetSession() ||
+        !requester->IsInWorld() ||
+        !IsValidRequestToken(token) ||
+        requestedBotName.empty() ||
+        itemLink.empty())
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (!ConsumeQuestRewardRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!RegisterQuestRewardToken(requester, token))
+    {
+        reason = "DUPLICATE";
+    }
+    else
+    {
+        Player* const bot = FindBotByName(requester, requestedBotName);
+        if (!bot)
+        {
+            reason = "NO_BOT";
+        }
+        else
+        {
+            effectiveBotName = bot->GetName();
+
+            PlayerbotAI* const botAI = GetBotAI(bot);
+            if (!botAI || !botAI->GetSecurity() ||
+                !botAI->GetSecurity()->CheckLevelFor(
+                    PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            {
+                reason = "FORBIDDEN";
+            }
+            else if (!bot->GetSession() || !bot->IsInWorld())
+            {
+                reason = "NOT_READY";
+            }
+            else
+            {
+                rewarded = ApplyNativeQuestReward(
+                    requester, bot, itemLink);
+
+                if (!rewarded)
+                    reason = "FAILED";
+            }
+        }
+    }
+
+    SendQuestRewardAck(
+        requester,
+        replyType,
+        token,
+        effectiveBotName,
+        rewarded,
+        reason);
+}
+// MB_QUEST_REWARD_V1_END
 // MB_RTSC_ORDER_V1_BEGIN
 bool ParseRtscUnsigned(std::string const& value, uint32 maximum, uint32& parsed)
 {
@@ -15879,6 +16798,115 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
     // MB_GROUP_ACTION_V1_DISPATCH_END
+    // MB_QUEST_ACCEPT_ALL_V1_DISPATCH_BEGIN
+    if (requestType == "QUEST_ACCEPT_ALL")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 2)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        RunQuestAcceptAllCommand(player, replyType, fields[1]);
+        return true;
+    }
+    // MB_QUEST_ACCEPT_ALL_V1_DISPATCH_END
+    // MB_QUEST_TALK_V1_DISPATCH_BEGIN
+
+    if (requestType == "QUEST_TALK")
+
+    {
+
+        std::string const token = GetSafeErrorToken(fields, 1);
+
+        if (fields.size() != 2)
+
+            return SendProtocolError(
+
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+
+
+        RunQuestTalkCommand(player, replyType, fields[1]);
+
+        return true;
+
+    }
+
+    // MB_QUEST_TALK_V1_DISPATCH_END
+    // MB_QUEST_GAMEOBJECT_USE_V1_DISPATCH_BEGIN
+    if (requestType == "QUEST_GAMEOBJECT_USE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false) ||
+            botName != Trim(botName))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        }
+
+        std::string gameObjectName;
+        if (!TryUrlDecodeField(fields[3], gameObjectName, kMaxCommandLength, false) ||
+            gameObjectName != Trim(gameObjectName))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_GAMEOBJECT_NAME");
+        }
+
+        RunQuestGameObjectUseCommand(
+            player,
+            replyType,
+            fields[1],
+            botName,
+            gameObjectName);
+        return true;
+    }
+    // MB_QUEST_GAMEOBJECT_USE_V1_DISPATCH_END
+    // MB_QUEST_REWARD_V1_DISPATCH_BEGIN
+    if (requestType == "QUEST_REWARD")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false) ||
+            botName != Trim(botName))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        }
+
+        std::string itemLink;
+        if (!TryUrlDecodeField(fields[3], itemLink, kMaxCommandLength, false) ||
+            itemLink != Trim(itemLink))
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_ITEM_LINK");
+        }
+
+        RunQuestRewardCommand(
+            player,
+            replyType,
+            fields[1],
+            botName,
+            itemLink);
+        return true;
+    }
+    // MB_QUEST_REWARD_V1_DISPATCH_END
     // MB_RTSC_ORDER_V1_DISPATCH_BEGIN
     if (requestType == "RTSC_ORDER")
     {
