@@ -178,6 +178,11 @@ std::size_t constexpr kBotLifecycleMaxRequesterStates = 512;
 std::size_t constexpr kBotLifecycleMaxPendingConnects = 64;
 std::chrono::seconds constexpr kSelfBotHeavyActionRateWindow(10);
 std::size_t constexpr kSelfBotHeavyActionMaxRequesterStates = 512;
+std::size_t constexpr kBotMaintenanceRateLimit = 4;
+std::chrono::seconds constexpr kBotMaintenanceRateWindow(10);
+std::chrono::seconds constexpr kBotMaintenanceReplayTtl(30);
+std::size_t constexpr kBotMaintenanceMaxRecentTokens = 32;
+std::size_t constexpr kBotMaintenanceMaxRequesterStates = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
@@ -238,6 +243,7 @@ char const* const kQuestGameObjectUseCapability = "QUEST_GAMEOBJECT_USE_V1";
 char const* const kQuestRewardCapability = "QUEST_REWARD_V1";
 char const* const kQuestRewardPolicyCapability = "QUEST_REWARD_POLICY_V1";
 char const* const kAutogearOptionsCapability = "AUTOGEAR_OPTIONS_V1";
+char const* const kBotMaintenanceCapability = "BOT_MAINTENANCE_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -298,6 +304,7 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
 void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
 void RunGroupActionCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& actionValue);
+void RunBotMaintenanceCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunQuestAcceptAllCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -388,7 +395,8 @@ kQuestAcceptAllCapability,
         kQuestGameObjectUseCapability,
         kQuestRewardCapability,
         kQuestRewardPolicyCapability,
-        kAutogearOptionsCapability
+        kAutogearOptionsCapability,
+        kBotMaintenanceCapability
     };
 
     std::vector<std::string> chunks;
@@ -12483,6 +12491,236 @@ bool HandleAutogearRequest(Player* requester, ChatMsg replyType,
 }
 // MB_AUTOGEAR_OPTIONS_V1_END
 
+// MB_BOT_MAINTENANCE_V1_BEGIN
+struct BotMaintenanceRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<uint64, BotMaintenanceRequestState> gBotMaintenanceRequestStates;
+
+void PruneBotMaintenanceRequestState(
+    BotMaintenanceRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kBotMaintenanceRateWindow)
+        state.requests.pop_front();
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kBotMaintenanceReplayTtl)
+        state.recentTokens.pop_front();
+
+    while (state.recentTokens.size() > kBotMaintenanceMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+BotMaintenanceRequestState* GetBotMaintenanceRequestState(Player* requester)
+{
+    if (!requester)
+        return nullptr;
+
+    auto const now = std::chrono::steady_clock::now();
+    uint64 const key = requester->GetGUID().GetCounter();
+    auto stateIt = gBotMaintenanceRequestStates.find(key);
+
+    if (stateIt == gBotMaintenanceRequestStates.end())
+    {
+        if (gBotMaintenanceRequestStates.size() >= kBotMaintenanceMaxRequesterStates)
+        {
+            for (auto it = gBotMaintenanceRequestStates.begin(); it != gBotMaintenanceRequestStates.end();)
+            {
+                PruneBotMaintenanceRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = gBotMaintenanceRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (gBotMaintenanceRequestStates.size() >= kBotMaintenanceMaxRequesterStates)
+            return nullptr;
+
+        stateIt = gBotMaintenanceRequestStates.emplace(key, BotMaintenanceRequestState{}).first;
+    }
+
+    PruneBotMaintenanceRequestState(stateIt->second, now);
+    return &stateIt->second;
+}
+
+bool ConsumeBotMaintenanceRateLimit(Player* requester)
+{
+    BotMaintenanceRequestState* const state = GetBotMaintenanceRequestState(requester);
+    if (!state)
+        return false;
+
+    if (state->requests.size() >= kBotMaintenanceRateLimit)
+        return false;
+
+    state->requests.push_back(std::chrono::steady_clock::now());
+    return true;
+}
+
+bool RegisterBotMaintenanceToken(Player* requester, std::string const& token)
+{
+    BotMaintenanceRequestState* const state = GetBotMaintenanceRequestState(requester);
+    if (!state)
+        return false;
+
+    for (auto const& entry : state->recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state->recentTokens.emplace_back(token, std::chrono::steady_clock::now());
+    while (state->recentTokens.size() > kBotMaintenanceMaxRecentTokens)
+        state->recentTokens.pop_front();
+    return true;
+}
+
+bool ApplyMaintenanceToBot(Player* bot, PlayerbotAI* botAI, std::string& reason)
+{
+    if (!bot || !botAI)
+    {
+        reason = "NO_AI";
+        return false;
+    }
+
+    if (!sPlayerbotAIConfig.maintenanceCommand)
+    {
+        reason = "DISABLED";
+        return false;
+    }
+
+    PlayerbotFactory factory(bot, bot->GetLevel());
+
+    if (!botAI->IsAltBot())
+    {
+        factory.InitAttunementQuests();
+        factory.InitBags(false);
+        factory.InitAmmo();
+        factory.InitFood();
+        factory.InitReagents();
+        factory.InitConsumables();
+        factory.InitPotions();
+        factory.InitTalentsTree(true);
+        factory.InitPet();
+        factory.InitPetTalents();
+        factory.InitSkills();
+        factory.InitClassSpells();
+        factory.InitAvailableSpells();
+        factory.InitReputation();
+        factory.InitSpecialSpells();
+        factory.InitMounts();
+        factory.InitGlyphs(false);
+        factory.InitKeyring();
+        if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+            factory.ApplyEnchantAndGemsNew();
+    }
+    else
+    {
+        if (sPlayerbotAIConfig.altMaintenanceAttunementQs)
+            factory.InitAttunementQuests();
+        if (sPlayerbotAIConfig.altMaintenanceBags)
+            factory.InitBags(false);
+        if (sPlayerbotAIConfig.altMaintenanceAmmo)
+            factory.InitAmmo();
+        if (sPlayerbotAIConfig.altMaintenanceFood)
+            factory.InitFood();
+        if (sPlayerbotAIConfig.altMaintenanceReagents)
+            factory.InitReagents();
+        if (sPlayerbotAIConfig.altMaintenanceConsumables)
+            factory.InitConsumables();
+        if (sPlayerbotAIConfig.altMaintenancePotions)
+            factory.InitPotions();
+        if (sPlayerbotAIConfig.altMaintenanceTalentTree)
+            factory.InitTalentsTree(true);
+        if (sPlayerbotAIConfig.altMaintenancePet)
+            factory.InitPet();
+        if (sPlayerbotAIConfig.altMaintenancePetTalents)
+            factory.InitPetTalents();
+        if (sPlayerbotAIConfig.altMaintenanceSkills)
+            factory.InitSkills();
+        if (sPlayerbotAIConfig.altMaintenanceClassSpells)
+            factory.InitClassSpells();
+        if (sPlayerbotAIConfig.altMaintenanceAvailableSpells)
+            factory.InitAvailableSpells();
+        if (sPlayerbotAIConfig.altMaintenanceReputation)
+            factory.InitReputation();
+        if (sPlayerbotAIConfig.altMaintenanceSpecialSpells)
+            factory.InitSpecialSpells();
+        if (sPlayerbotAIConfig.altMaintenanceMounts)
+            factory.InitMounts();
+        if (sPlayerbotAIConfig.altMaintenanceGlyphs)
+            factory.InitGlyphs(false);
+        if (sPlayerbotAIConfig.altMaintenanceKeyring)
+            factory.InitKeyring();
+        if (sPlayerbotAIConfig.altMaintenanceGemsEnchants &&
+            bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
+            factory.ApplyEnchantAndGemsNew();
+    }
+
+    bot->DurabilityRepairAll(false, 1.0f, false);
+    bot->SendTalentsInfoData(false);
+    reason = "APPLIED";
+    return true;
+}
+
+void SendBotMaintenanceAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    std::string const& botName,
+    bool ok,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "BOT_MAINTENANCE_ACK", payload.str());
+}
+
+void RunBotMaintenanceCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    std::string const effectiveBotName = bot ? bot->GetName() : botName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (!ConsumeBotMaintenanceRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterBotMaintenanceToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (bot == requester)
+        reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else
+        ok = ApplyMaintenanceToBot(bot, botAI, reason);
+
+    SendBotMaintenanceAck(requester, replyType, token, effectiveBotName, ok, reason);
+}
+// MB_BOT_MAINTENANCE_V1_END
+
 void RunSelfActionCommand(
     Player* requester,
     ChatMsg replyType,
@@ -12549,83 +12787,8 @@ void RunSelfActionCommand(
         {
             if (!argument.empty())
                 reason = "BAD_ARGUMENT";
-            else if (!sPlayerbotAIConfig.maintenanceCommand)
-                reason = "DISABLED";
             else
-            {
-                PlayerbotFactory factory(requester, requester->GetLevel());
-
-                if (!botAI->IsAltBot())
-                {
-                    factory.InitAttunementQuests();
-                    factory.InitBags(false);
-                    factory.InitAmmo();
-                    factory.InitFood();
-                    factory.InitReagents();
-                    factory.InitConsumables();
-                    factory.InitPotions();
-                    factory.InitTalentsTree(true);
-                    factory.InitPet();
-                    factory.InitPetTalents();
-                    factory.InitSkills();
-                    factory.InitClassSpells();
-                    factory.InitAvailableSpells();
-                    factory.InitReputation();
-                    factory.InitSpecialSpells();
-                    factory.InitMounts();
-                    factory.InitGlyphs(false);
-                    factory.InitKeyring();
-                    if (requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
-                        factory.ApplyEnchantAndGemsNew();
-                }
-                else
-                {
-                    if (sPlayerbotAIConfig.altMaintenanceAttunementQs)
-                        factory.InitAttunementQuests();
-                    if (sPlayerbotAIConfig.altMaintenanceBags)
-                        factory.InitBags(false);
-                    if (sPlayerbotAIConfig.altMaintenanceAmmo)
-                        factory.InitAmmo();
-                    if (sPlayerbotAIConfig.altMaintenanceFood)
-                        factory.InitFood();
-                    if (sPlayerbotAIConfig.altMaintenanceReagents)
-                        factory.InitReagents();
-                    if (sPlayerbotAIConfig.altMaintenanceConsumables)
-                        factory.InitConsumables();
-                    if (sPlayerbotAIConfig.altMaintenancePotions)
-                        factory.InitPotions();
-                    if (sPlayerbotAIConfig.altMaintenanceTalentTree)
-                        factory.InitTalentsTree(true);
-                    if (sPlayerbotAIConfig.altMaintenancePet)
-                        factory.InitPet();
-                    if (sPlayerbotAIConfig.altMaintenancePetTalents)
-                        factory.InitPetTalents();
-                    if (sPlayerbotAIConfig.altMaintenanceSkills)
-                        factory.InitSkills();
-                    if (sPlayerbotAIConfig.altMaintenanceClassSpells)
-                        factory.InitClassSpells();
-                    if (sPlayerbotAIConfig.altMaintenanceAvailableSpells)
-                        factory.InitAvailableSpells();
-                    if (sPlayerbotAIConfig.altMaintenanceReputation)
-                        factory.InitReputation();
-                    if (sPlayerbotAIConfig.altMaintenanceSpecialSpells)
-                        factory.InitSpecialSpells();
-                    if (sPlayerbotAIConfig.altMaintenanceMounts)
-                        factory.InitMounts();
-                    if (sPlayerbotAIConfig.altMaintenanceGlyphs)
-                        factory.InitGlyphs(false);
-                    if (sPlayerbotAIConfig.altMaintenanceKeyring)
-                        factory.InitKeyring();
-                    if (sPlayerbotAIConfig.altMaintenanceGemsEnchants &&
-                        requester->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
-                        factory.ApplyEnchantAndGemsNew();
-                }
-
-                requester->DurabilityRepairAll(false, 1.0f, false);
-                requester->SendTalentsInfoData(false);
-                ok = true;
-                reason = "APPLIED";
-            }
+                ok = ApplyMaintenanceToBot(requester, botAI, reason);
         }
         else
             reason = "UNSUPPORTED_ACTION";
@@ -17277,6 +17440,31 @@ if (requestType == "ATTACK_ORDER")
     return true;
 }
 // MB_ATTACK_ORDER_V1_DISPATCH_END
+
+    // MB_BOT_MAINTENANCE_V1_DISPATCH_BEGIN
+    if (requestType == "BOT_MAINTENANCE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 3)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+            botName != Trim(botName) || botName.empty())
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        }
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        RunBotMaintenanceCommand(player, replyType, botName, fields[2]);
+        return true;
+    }
+    // MB_BOT_MAINTENANCE_V1_DISPATCH_END
 
     if (requestType == "STRATEGY")
     {
