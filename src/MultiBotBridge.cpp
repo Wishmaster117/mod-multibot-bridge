@@ -237,6 +237,7 @@ char const* const kQuestTalkCapability = "QUEST_TALK_V1";
 char const* const kQuestGameObjectUseCapability = "QUEST_GAMEOBJECT_USE_V1";
 char const* const kQuestRewardCapability = "QUEST_REWARD_V1";
 char const* const kQuestRewardPolicyCapability = "QUEST_REWARD_POLICY_V1";
+char const* const kAutogearOptionsCapability = "AUTOGEAR_OPTIONS_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -386,7 +387,8 @@ kQuestAcceptAllCapability,
         kQuestTalkCapability,
         kQuestGameObjectUseCapability,
         kQuestRewardCapability,
-        kQuestRewardPolicyCapability
+        kQuestRewardPolicyCapability,
+        kAutogearOptionsCapability
     };
 
     std::vector<std::string> chunks;
@@ -12149,6 +12151,338 @@ void SendSelfActionAck(
     SendStateAddonPacket(requester, replyType, "SELF_ACTION_ACK", fallbackPayload.str());
 }
 
+// MB_AUTOGEAR_OPTIONS_V1_BEGIN
+// Ordinary bots only. Preparation never mutates gear; APPLY consumes its plan first.
+struct AutogearPlan
+{
+    std::string token, botName, mode;
+    uint64 botGuid = 0;
+    uint32 value = 0, quality = 0, ilvl = 0, qualityCap = 0, ilvlCap = 0;
+    uint32 requesterMap = 0, botMap = 0;
+    bool reset = false, secondChance = false;
+    std::vector<uint64> worn;
+    std::chrono::steady_clock::time_point created;
+};
+struct AutogearResult
+{
+    std::string token, reason;
+    bool ok = false;
+    uint32 changed = 0, empty = 0;
+};
+struct AutogearRequesterState
+{
+    AutogearPlan plan;
+    std::deque<AutogearResult> results;
+    uint32 reads = 0;
+    std::chrono::steady_clock::time_point readStart, seen;
+};
+std::map<uint64, AutogearRequesterState> gAutogearRequesters;
+std::map<uint64, std::chrono::steady_clock::time_point> gAutogearBotCooldowns;
+
+void SendAutogearReply(Player* requester, ChatMsg replyType, char const* opcode,
+    std::string const& token, bool ok, std::string const& reason,
+    uint32 first = 0, uint32 second = 0, int reset = -1)
+{
+    std::ostringstream payload;
+    payload << token << '~' << (ok ? "OK" : "ERR") << '~' << reason << '~' << first << '~' << second;
+    if (reset >= 0)
+        payload << '~' << reset;
+    SendAddonPacket(requester, replyType, opcode, payload.str());
+}
+
+AutogearRequesterState* GetAutogearRequesterState(Player* requester)
+{
+    auto const now = std::chrono::steady_clock::now();
+    for (auto it = gAutogearRequesters.begin(); it != gAutogearRequesters.end();)
+    {
+        if (now - it->second.seen > std::chrono::minutes(5))
+            it = gAutogearRequesters.erase(it);
+        else
+            ++it;
+    }
+    uint64 const key = requester->GetGUID().GetCounter();
+    auto found = gAutogearRequesters.find(key);
+    if (found == gAutogearRequesters.end())
+    {
+        if (gAutogearRequesters.size() >= 512)
+            return nullptr;
+        found = gAutogearRequesters.emplace(key, AutogearRequesterState{}).first;
+        found->second.readStart = now;
+    }
+    found->second.seen = now;
+    return &found->second;
+}
+
+std::vector<uint64> AutogearWornSnapshot(Player* bot)
+{
+    std::vector<uint64> result;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        if (slot == EQUIPMENT_SLOT_BODY || slot == EQUIPMENT_SLOT_TABARD)
+            continue;
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        result.push_back(item ? item->GetGUID().GetCounter() : 0);
+    }
+    return result;
+}
+
+bool ResolveAutogearTarget(Player* requester, std::string const& name, Player*& bot,
+    uint32& qualityCap, uint32& ilvlCap, std::string& reason)
+{
+    bot = FindBotByName(requester, name);
+    if (!bot || bot == requester)
+        reason = "NO_BOT";
+    else if (!requester->IsInWorld() || !bot->IsInWorld() || !bot->GetSession())
+        reason = "NOT_IN_WORLD";
+    else if (!bot->IsAlive())
+        reason = "DEAD";
+    else if (bot->IsInCombat())
+        reason = "IN_COMBAT";
+    else if (bot->GetLevel() < 5)
+        reason = "LEVEL_TOO_LOW";
+    else
+    {
+        PlayerbotAI* const ai = GetBotAI(bot);
+        if (!ai || !ai->GetSecurity() ||
+            !ai->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            reason = "FORBIDDEN";
+        else if (!sPlayerbotAIConfig.autoGearCommand)
+            reason = "DISABLED";
+        else if (!sPlayerbotAIConfig.autoGearCommandAltBots &&
+            !sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
+            reason = "ALT_BOT_REFUSED";
+        else if (sPlayerbotAIConfig.autoGearQualityLimit < 1 || sPlayerbotAIConfig.autoGearQualityLimit > 7 ||
+            sPlayerbotAIConfig.autoGearScoreLimit < 0 || sPlayerbotAIConfig.autoGearScoreLimit > 99999)
+            reason = "BAD_CONFIG";
+        else
+        {
+            qualityCap = static_cast<uint32>(sPlayerbotAIConfig.autoGearQualityLimit);
+            ilvlCap = static_cast<uint32>(sPlayerbotAIConfig.autoGearScoreLimit);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ResolveAutogearOptions(Player* requester, std::string const& mode, uint32 value,
+    uint32 qualityCap, uint32 ilvlCap, uint32& quality, uint32& ilvl, std::string& reason)
+{
+    quality = qualityCap;
+    ilvl = ilvlCap;
+    if (mode == "DEFAULT" && value == 0)
+        return true;
+    if (mode == "QUALITY" && value >= 1 && value <= 7)
+    {
+        quality = std::min(value, qualityCap);
+        return true;
+    }
+    uint32 requested = value;
+    if (mode == "MATCH" && value == 0)
+    {
+        uint32 sum = 0, count = 0;
+        // The reference is the authenticated requester, not an arbitrary client iLvl or bot master.
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            if (slot == EQUIPMENT_SLOT_BODY || slot == EQUIPMENT_SLOT_TABARD)
+                continue;
+            if (Item* const item = requester->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                if (!item->GetTemplate())
+                    continue;
+                sum += item->GetTemplate()->ItemLevel;
+                ++count;
+            }
+        }
+        requested = count ? sum / count : 0;
+        if (!requested)
+        {
+            reason = "NO_REFERENCE_GEAR";
+            return false;
+        }
+    }
+    else if (mode != "ILVL" || value < 6 || value > 99999)
+    {
+        reason = "BAD_ARGUMENT";
+        return false;
+    }
+    ilvl = ilvlCap ? std::min(requested, ilvlCap) : requested;
+    return true;
+}
+
+bool ConsumeAutogearBotCooldown(uint64 guid)
+{
+    auto const now = std::chrono::steady_clock::now();
+    for (auto it = gAutogearBotCooldowns.begin(); it != gAutogearBotCooldowns.end();)
+    {
+        if (now - it->second >= std::chrono::seconds(10))
+            it = gAutogearBotCooldowns.erase(it);
+        else
+            ++it;
+    }
+    if (gAutogearBotCooldowns.count(guid) || gAutogearBotCooldowns.size() >= 2048)
+        return false;
+    gAutogearBotCooldowns.emplace(guid, now);
+    return true;
+}
+
+void ApplyPreparedAutogear(Player* requester, ChatMsg replyType,
+    AutogearRequesterState& state, std::string const& token)
+{
+    for (AutogearResult const& result : state.results)
+    {
+        if (result.token == token)
+        {
+            SendAutogearReply(requester, replyType, "AUTOGEAR_RESULT", token,
+                result.ok, result.reason, result.changed, result.empty);
+            return;
+        }
+    }
+    if (state.plan.token != token)
+    {
+        SendAutogearReply(requester, replyType, "AUTOGEAR_RESULT", token, false, "PLAN_EXPIRED");
+        return;
+    }
+    AutogearPlan const plan = state.plan;
+    state.plan = AutogearPlan{};
+    // Record consumption before any factory/destruction call, even if execution fails.
+    AutogearResult result;
+    result.token = token;
+    result.reason = "EXECUTION_FAILED";
+    state.results.push_back(result);
+    while (state.results.size() > 128)
+        state.results.pop_front();
+
+    Player* bot = nullptr;
+    uint32 qualityCap = 0, ilvlCap = 0, quality = 0, ilvl = 0;
+    if (std::chrono::steady_clock::now() - plan.created > std::chrono::seconds(30))
+        result.reason = "PLAN_EXPIRED";
+    else if (!ResolveAutogearTarget(requester, plan.botName, bot, qualityCap, ilvlCap, result.reason))
+    {
+        // The resolver reports the authoritative refusal.
+    }
+    else if (bot->GetGUID().GetCounter() != plan.botGuid || bot->GetMapId() != plan.botMap ||
+        requester->GetMapId() != plan.requesterMap || AutogearWornSnapshot(bot) != plan.worn)
+        result.reason = "TARGET_CHANGED";
+    else if (!ResolveAutogearOptions(requester, plan.mode, plan.value, qualityCap, ilvlCap, quality, ilvl, result.reason))
+    {
+        // No mutation after an invalid reference or argument.
+    }
+    else if (quality != plan.quality || ilvl != plan.ilvl || qualityCap != plan.qualityCap ||
+        ilvlCap != plan.ilvlCap || sPlayerbotAIConfig.twoRoundsGearInit != plan.secondChance)
+        result.reason = "PLAN_CHANGED";
+    else if (!ConsumeAutogearBotCooldown(plan.botGuid))
+        result.reason = "COOLDOWN";
+    else
+    {
+        try
+        {
+            if (plan.reset)
+                PlayerbotFactory::DestroyEquippedGear(bot);
+            PlayerbotFactory::AutoGear(bot, quality, ilvl, !plan.reset,
+                plan.reset && plan.secondChance);
+            auto const after = AutogearWornSnapshot(bot);
+            for (std::size_t i = 0; i < after.size(); ++i)
+            {
+                if (after[i] != plan.worn[i])
+                    ++result.changed;
+                if (!after[i])
+                    ++result.empty;
+            }
+            result.ok = true;
+            result.reason = "COMPLETED";
+        }
+        catch (...)
+        {
+            // Gear changes are not transactional. Never retry a partially executed reset.
+            result.reason = "EXECUTION_FAILED";
+        }
+    }
+    state.results.back() = result;
+    SendAutogearReply(requester, replyType, "AUTOGEAR_RESULT", token,
+        result.ok, result.reason, result.changed, result.empty);
+}
+
+bool HandleAutogearRequest(Player* requester, ChatMsg replyType,
+    std::vector<std::string> const& fields)
+{
+    std::string const& type = fields[0];
+    std::string const token = GetSafeErrorToken(fields, 1);
+    std::size_t const expected = type == "AUTOGEAR_INFO" ? 3 : (type == "AUTOGEAR_PLAN" ? 6 : 2);
+    if (fields.size() != expected)
+        return SendProtocolError(requester, replyType, "RUN", type, token, "BAD_FIELD_COUNT");
+    if (!IsValidRequestToken(fields[1]))
+        return SendProtocolError(requester, replyType, "RUN", type, "", "BAD_TOKEN");
+    if (!requester || !requester->GetSession() || !requester->IsInWorld())
+        return SendProtocolError(requester, replyType, "RUN", type, token, "NO_SESSION");
+    AutogearRequesterState* const state = GetAutogearRequesterState(requester);
+    if (!state)
+        return SendProtocolError(requester, replyType, "RUN", type, token, "BUSY");
+    if (type == "AUTOGEAR_APPLY")
+    {
+        ApplyPreparedAutogear(requester, replyType, *state, token);
+        return true;
+    }
+    auto const now = std::chrono::steady_clock::now();
+    if (now - state->readStart >= std::chrono::seconds(2))
+    {
+        state->readStart = now;
+        state->reads = 0;
+    }
+    if (++state->reads > 64)
+        return SendProtocolError(requester, replyType, "RUN", type, token, "RATE_LIMIT");
+    std::string name;
+    if (!TryUrlDecodeField(fields[2], name, kMaxBotNameLength, false) || name != Trim(name))
+        return SendProtocolError(requester, replyType, "RUN", type, token, "BAD_TARGET");
+    Player* bot = nullptr;
+    uint32 qualityCap = 0, ilvlCap = 0;
+    std::string reason;
+    char const* const response = type == "AUTOGEAR_INFO" ? "AUTOGEAR_INFO" : "AUTOGEAR_READY";
+    int const resetField = type == "AUTOGEAR_INFO" ? -1 : 0;
+    if (!ResolveAutogearTarget(requester, name, bot, qualityCap, ilvlCap, reason))
+    {
+        SendAutogearReply(requester, replyType, response, token, false, reason, 0, 0, resetField);
+        return true;
+    }
+    if (type == "AUTOGEAR_INFO")
+    {
+        SendAutogearReply(requester, replyType, response, token, true, "READY", qualityCap, ilvlCap);
+        return true;
+    }
+    uint32 value = 0;
+    if (fields[4].size() > 5 || !TryParseUint32Field(fields[4], 0, 99999, value))
+        return SendProtocolError(requester, replyType, "RUN", type, token, "BAD_ARGUMENT");
+    if (fields[5] != "0" && fields[5] != "1")
+        return SendProtocolError(requester, replyType, "RUN", type, token, "BAD_RESET");
+    for (AutogearResult const& result : state->results)
+        if (result.token == token)
+            return SendProtocolError(requester, replyType, "RUN", type, token, "TOKEN_USED");
+    if (state->plan.token == token)
+        return SendProtocolError(requester, replyType, "RUN", type, token, "TOKEN_USED");
+    AutogearPlan plan;
+    if (!ResolveAutogearOptions(requester, fields[3], value, qualityCap, ilvlCap, plan.quality, plan.ilvl, reason))
+    {
+        SendAutogearReply(requester, replyType, response, token, false, reason, 0, 0, 0);
+        return true;
+    }
+    plan.token = token;
+    plan.botName = bot->GetName();
+    plan.botGuid = bot->GetGUID().GetCounter();
+    plan.mode = fields[3];
+    plan.value = value;
+    plan.qualityCap = qualityCap;
+    plan.ilvlCap = ilvlCap;
+    plan.reset = fields[5] == "1";
+    plan.secondChance = sPlayerbotAIConfig.twoRoundsGearInit;
+    plan.requesterMap = requester->GetMapId();
+    plan.botMap = bot->GetMapId();
+    plan.worn = AutogearWornSnapshot(bot);
+    plan.created = now;
+    state->plan = plan;
+    SendAutogearReply(requester, replyType, response, token, true, "READY", plan.quality, plan.ilvl, plan.reset ? 1 : 0);
+    return true;
+}
+// MB_AUTOGEAR_OPTIONS_V1_END
+
 void RunSelfActionCommand(
     Player* requester,
     ChatMsg replyType,
@@ -16112,6 +16446,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         RunSelfBotCommand(player, replyType, fields[1], desiredState);
         return true;
     }
+
+    if (requestType == "AUTOGEAR_INFO" || requestType == "AUTOGEAR_PLAN" || requestType == "AUTOGEAR_APPLY")
+        return HandleAutogearRequest(player, replyType, fields);
 
     if (requestType == "SELF_ACTION")
     {

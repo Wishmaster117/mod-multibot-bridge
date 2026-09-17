@@ -64,6 +64,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Roster & presence** | Provide bridge-visible bots, account-alt presence and structured roster data. |
 | **Bot lifecycle** | Structured unit connect/disconnect/state, bounded real-group bulk connect/disconnect for the Faction Banner, plus human-safe grouped-Playerbot removal for Raidus. |
 | **Creator AddClass** | Dedicated `CREATOR_ADDCLASS_V1` endpoint for validated class/gender AddClass requests without exposing an arbitrary Playerbots command channel. |
+| **Creator Auto Init** | Dedicated `CREATOR_INIT_AUTO_V1` target/group endpoint that delegates bounded initialization to Playerbots without accepting raw command text from the addon. |
 | **Target resolution** | Resolve an authorized bot name to the canonical lifecycle target used by social rosters. |
 | **Bot state** | Framed strategy/state reads used by the addon UI. |
 | **Strategy mutations** | Structured strategy changes for migrated controls. |
@@ -73,7 +74,8 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Talents** | Premade specialization and custom talent application with server-side validation. |
 | **Professions** | Recipe listing/crafting and exact item-target recipes. |
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
-| **Quests** | Structured quest data and bot quest abandon. |
+| **Quests** | Structured quest data/abandon plus accept-all, talk, gameobject-use, reward and reward-policy endpoints. |
+| **Autogear** | `AUTOGEAR_OPTIONS_V1` provides server limits and a validated INFO/PLAN/APPLY workflow for quality/iLvl-based equipment generation. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
 | **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1`, bounded `GROUP_ACTION_V1` and `RTSC_ORDER_V1` endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
@@ -143,7 +145,21 @@ The Bridge does **not** accept a raw Playerbots command from the addon and does 
 
 Runtime validation on **6 September 2026** confirmed Random, Male, Female and Death Knight AddClass flows, preserved addon auto-group/roster behavior, and no legacy `.playerbot bot addclass ...` SAY on the normal bridge-first path.
 
-`init=auto` remains outside this endpoint and is intentionally unchanged pending its own targeted migration.
+`init=auto` is handled separately through the bounded `CREATOR_INIT_AUTO_V1` endpoint described below.
+
+---
+
+# Creator Auto Init
+
+Creator initialization uses the dedicated capability:
+
+```text
+CREATOR_INIT_AUTO_V1
+```
+
+The Bridge accepts only the semantic modes `TARGET` and `GROUP`. Target names are decoded and bounded server-side; group mode uses the requester's real group membership. Rate limiting and replay protection are enforced before any mutation.
+
+For eligible controlled bots the Bridge delegates to Playerbots' native `ProcessBotCommand("init=auto", ...)` path and classifies the native result into structured initialized/skipped/failed outcomes. It does not expose a generic Playerbots command executor. Existing Playerbots authorization and initialization rules remain authoritative.
 
 ---
 
@@ -281,6 +297,36 @@ A post-RTSC warning cleanup re-exposes the AzerothCore base `OnPlayerCanUseChat`
 
 ---
 
+# Structured Quest Interactions
+
+The Bridge now advertises the bounded Quest interaction family:
+
+```text
+QUEST_ACCEPT_ALL_V1
+QUEST_TALK_V1
+QUEST_GAMEOBJECT_USE_V1
+QUEST_REWARD_V1
+QUEST_REWARD_POLICY_V1
+```
+
+These endpoints keep requester/group/bot authorization, bounded fields and result accounting server-side while adapting to the audited native Playerbots quest actions. The reward policy is reported as authoritative Bridge state so the addon can distinguish automatic and manual reward selection. No generic Playerbots command executor is introduced.
+
+---
+
+# Autogear Options
+
+Autogear uses the dedicated capability:
+
+```text
+AUTOGEAR_OPTIONS_V1
+```
+
+The Bridge exposes authoritative server limits and handles the validated `AUTOGEAR_INFO → AUTOGEAR_PLAN → AUTOGEAR_APPLY` workflow. Supported option families are server defaults, explicit maximum quality, requester-equipment iLvl matching and explicit target iLvl, with an optional reset flag.
+
+The PLAN step returns a bounded summary for user confirmation before APPLY performs the mutation. Requester/control rights, bot state, level requirements, numeric limits, cooldown/rate constraints and plan consistency are revalidated server-side. The addon does not become the authority for Autogear eligibility.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -343,12 +389,20 @@ BOT_LIFECYCLE_V1
 BOT_TARGET_RESOLVE_V1
 BOT_GROUP_REMOVE_V1
 BOT_GROUP_LIFECYCLE_V1
+CREATOR_ADDCLASS_V1
+CREATOR_INIT_AUTO_V1
 FOLLOW_ORDER_V1
 STAY_ORDER_V1
 ATTACK_ORDER_V1
 FLEE_ORDER_V1
 GROUP_ACTION_V1
 RTSC_ORDER_V1
+QUEST_ACCEPT_ALL_V1
+QUEST_TALK_V1
+QUEST_GAMEOBJECT_USE_V1
+QUEST_REWARD_V1
+QUEST_REWARD_POLICY_V1
+AUTOGEAR_OPTIONS_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -361,6 +415,18 @@ The exact packet schemas are implementation details shared with the addon and ma
 - `mod-playerbots` installed and working.
 - A normal AzerothCore module build environment.
 - The companion [`MultiBot-Chatless`](https://github.com/Wishmaster117/MultiBot-Chatless) addon for the client UI.
+
+## Important — Playerbots build compatibility
+
+`mod-multibot-bridge` must be configured and compiled against the **current `master` revision of the official [`mod-playerbots`](https://github.com/mod-playerbots/mod-playerbots) repository**. Do not assume compatibility with an older checkout, an archived revision or an unrelated fork. Synchronize `modules/mod-playerbots` with the official repository before configuring/rebuilding the Bridge.
+
+Validated upstream revision on **17 September 2026**:
+
+```text
+b6696bdbd3740e575598d167d69f39f68cc0b907
+```
+
+This SHA records the revision used for the current validation; the compatibility rule remains to use the current official `master` revision when building the Bridge.
 
 ---
 
@@ -397,9 +463,9 @@ Collective **Follow**, **Stay** and **Attack** are implemented through dedicated
 
 The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *` is migrated through `BOT_GROUP_LIFECYCLE_V1`. Runtime validation confirmed structured disconnect/reconnect of grouped Playerbots without forcing group-slot removal, while the actual login/logout operations remain delegated to Playerbots.
 
-Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
+Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Creator `init=auto` is also migrated through the bounded `CREATOR_INIT_AUTO_V1` target/group adapter. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is now also migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The next active migration is Quest interactions, followed by remaining ordinary-bot actions and final legacy parser/fallback cleanup.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are now present, and `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow. Remaining ordinary-bot actions and final legacy parser/fallback cleanup are the next migration areas.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
