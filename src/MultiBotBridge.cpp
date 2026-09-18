@@ -19,6 +19,9 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "QuestPackets.h"
+#include "CharmInfo.h"
+#include "CreatureAI.h"
+#include "Pet.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
@@ -45,6 +48,8 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <random>
+#include <unordered_set>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -234,6 +239,10 @@ char const* const kBotTargetResolveCapability = "BOT_TARGET_RESOLVE_V1";
 char const* const kFollowOrderCapability = "FOLLOW_ORDER_V1";
 char const* const kStayOrderCapability = "STAY_ORDER_V1";
 char const* const kAttackOrderCapability = "ATTACK_ORDER_V1";
+char const* const kHunterPetControlCapability = "HUNTER_PET_CONTROL_V1";
+char const* const kHunterPetManageCapability = "HUNTER_PET_MANAGE_V1";
+char const* const kHunterPetLifecycleCapability = "HUNTER_PET_LIFECYCLE_V1";
+std::unordered_set<std::string> gHunterPetDismissedStrategyRestore;
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
 char const* const kGroupActionCapability = "GROUP_ACTION_V1";
 char const* const kRtscOrderCapability = "RTSC_ORDER_V1";
@@ -302,6 +311,10 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
 void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void RunAttackOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue);
+void RunHunterPetControlCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue);
+void RunHunterPetManageCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& argumentValue);
+bool IsBotInRequesterGroup(Player* requester, Player* bot);
+bool IsBotMasteredByRequester(Player* requester, Player* bot);
 void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
 void RunGroupActionCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& actionValue);
 void RunBotMaintenanceCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -387,6 +400,9 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
 kFollowOrderCapability,
 kStayOrderCapability,
 kAttackOrderCapability,
+kHunterPetControlCapability,
+kHunterPetManageCapability,
+kHunterPetLifecycleCapability,
 kFleeOrderCapability,
 kGroupActionCapability,
 kRtscOrderCapability,
@@ -9320,6 +9336,860 @@ void RunStayOrderCommand(Player* requester, ChatMsg replyType, std::string const
     RunGroupOrderCommand(requester, replyType, requestToken, false);
 }
 // MB_FOLLOW_STAY_ORDER_V1_END
+// MB_HUNTER_PET_CONTROL_V1_BEGIN
+bool IsAllowedHunterPetControlAction(std::string const& action)
+{
+    return action == "AGGRESSIVE" ||
+        action == "DEFENSIVE" ||
+        action == "PASSIVE" ||
+        action == "STANCE" ||
+        action == "ATTACK" ||
+        action == "FOLLOW" ||
+        action == "STAY";
+}
+
+std::vector<Creature*> GetHunterPetControlTargets(Player* bot)
+{
+    std::vector<Creature*> targets;
+    if (!bot)
+        return targets;
+
+    Pet* const pet = bot->GetPet();
+    if (pet)
+        targets.push_back(pet);
+
+    for (Unit::ControlSet::const_iterator it = bot->m_Controlled.begin(); it != bot->m_Controlled.end(); ++it)
+    {
+        Creature* const creature = (*it) ? (*it)->ToCreature() : nullptr;
+        if (!creature || creature == pet || creature->IsTotem())
+            continue;
+
+        targets.push_back(creature);
+    }
+
+    return targets;
+}
+
+std::string GetHunterPetReactState(std::vector<Creature*> const& targets)
+{
+    std::string result;
+
+    for (Creature* const target : targets)
+    {
+        if (!target)
+            continue;
+
+        std::string current = "UNKNOWN";
+        switch (target->GetReactState())
+        {
+            case REACT_AGGRESSIVE:
+                current = "AGGRESSIVE";
+                break;
+            case REACT_DEFENSIVE:
+                current = "DEFENSIVE";
+                break;
+            case REACT_PASSIVE:
+                current = "PASSIVE";
+                break;
+            default:
+                current = "UNKNOWN";
+                break;
+        }
+
+        if (result.empty())
+            result = current;
+        else if (result != current)
+            return "MIXED";
+    }
+
+    return result.empty() ? "NONE" : result;
+}
+
+bool HasAliveHunterPetControlTarget(std::vector<Creature*> const& targets)
+{
+    for (Creature* const target : targets)
+        if (target && target->IsAlive())
+            return true;
+
+    return false;
+}
+
+bool ResolveHunterPetControlBot(
+    Player* requester,
+    std::string const& botName,
+    Player*& bot,
+    PlayerbotAI*& botAI,
+    std::string& reason)
+{
+    bot = FindBotByName(requester, botName);
+    botAI = nullptr;
+
+    if (!requester || !bot || bot == requester)
+    {
+        reason = "NO_BOT";
+        return false;
+    }
+
+    if (!requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        reason = "NOT_IN_WORLD";
+        return false;
+    }
+
+    if (requester->GetMapId() != bot->GetMapId())
+    {
+        reason = "MAP_MISMATCH";
+        return false;
+    }
+
+    if (!IsBotMasteredByRequester(requester, bot) && !IsBotInRequesterGroup(requester, bot))
+    {
+        reason = "NOT_ALLOWED";
+        return false;
+    }
+
+    if (bot->getClass() != CLASS_HUNTER)
+    {
+        reason = "NOT_HUNTER";
+        return false;
+    }
+
+    botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        reason = "NO_AI";
+        return false;
+    }
+
+    reason = "OK";
+    return true;
+}
+
+bool ApplyHunterPetControl(
+    Player* requester,
+    Player* bot,
+    PlayerbotAI* botAI,
+    std::string const& action,
+    std::string& stance,
+    std::string& reason)
+{
+    std::vector<Creature*> const targets = GetHunterPetControlTargets(bot);
+    stance = GetHunterPetReactState(targets);
+
+    if (targets.empty())
+    {
+        reason = "NO_PET";
+        return false;
+    }
+
+    if (action == "STANCE")
+    {
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "AGGRESSIVE" || action == "DEFENSIVE" || action == "PASSIVE")
+    {
+        ReactStates react = REACT_DEFENSIVE;
+        if (action == "AGGRESSIVE")
+            react = REACT_AGGRESSIVE;
+        else if (action == "PASSIVE")
+            react = REACT_PASSIVE;
+
+        for (Creature* const target : targets)
+        {
+            if (!target)
+                continue;
+
+            target->SetReactState(react);
+            if (CharmInfo* const charmInfo = target->GetCharmInfo())
+                charmInfo->SetPlayerReactState(react);
+        }
+
+        stance = action;
+        reason = "OK";
+        return true;
+    }
+
+    if (!HasAliveHunterPetControlTarget(targets))
+    {
+        reason = "PET_DEAD";
+        return false;
+    }
+
+    if (action == "FOLLOW")
+    {
+        botAI->PetFollow();
+        stance = GetHunterPetReactState(targets);
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "STAY")
+    {
+        for (Creature* const target : targets)
+        {
+            if (!target || !target->IsAlive())
+                continue;
+
+            bool const controlledMotion =
+                target->GetMotionMaster()->GetMotionSlotType(MOTION_SLOT_CONTROLLED) != NULL_MOTION_TYPE;
+            if (!controlledMotion)
+            {
+                target->StopMovingOnCurrentPos();
+                target->GetMotionMaster()->Clear(false);
+                target->GetMotionMaster()->MoveIdle();
+            }
+
+            if (CharmInfo* const charmInfo = target->GetCharmInfo())
+            {
+                charmInfo->SetCommandState(COMMAND_STAY);
+                charmInfo->SetIsCommandAttack(false);
+                charmInfo->SetIsCommandFollow(false);
+                charmInfo->SetIsFollowing(false);
+                charmInfo->SetIsReturning(false);
+                charmInfo->SetIsAtStay(!controlledMotion);
+                charmInfo->SaveStayPosition(controlledMotion);
+
+                if (Pet* const pet = target->ToPet())
+                    pet->ClearCastWhenWillAvailable();
+
+                charmInfo->SetForcedSpell(0);
+                charmInfo->SetForcedTargetGUID();
+            }
+        }
+
+        stance = GetHunterPetReactState(targets);
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "ATTACK")
+    {
+        ObjectGuid const targetGuid = requester->GetTarget();
+        if (!targetGuid)
+        {
+            reason = "NO_TARGET";
+            return false;
+        }
+
+        Unit* const targetUnit = botAI->GetUnit(targetGuid);
+        if (!targetUnit || !targetUnit->IsInWorld())
+        {
+            reason = "NO_TARGET";
+            return false;
+        }
+
+        if (!targetUnit->IsAlive())
+        {
+            reason = "TARGET_DEAD";
+            return false;
+        }
+
+        if (!bot->IsValidAttackTarget(targetUnit))
+        {
+            reason = "INVALID_TARGET";
+            return false;
+        }
+
+        if (sPlayerbotAIConfig.IsPvpProhibited(bot->GetZoneId(), bot->GetAreaId()) &&
+            (targetUnit->IsPlayer() || targetUnit->IsPet()) &&
+            (!bot->duel || bot->duel->Opponent != targetUnit))
+        {
+            reason = "PVP_PROHIBITED";
+            return false;
+        }
+
+        bool didAttack = false;
+        for (Creature* const petCreature : targets)
+        {
+            if (!petCreature || !petCreature->IsAlive())
+                continue;
+
+            CharmInfo* const charmInfo = petCreature->GetCharmInfo();
+            if (!charmInfo)
+                continue;
+
+            petCreature->ClearUnitState(UNIT_STATE_FOLLOW);
+            if (petCreature->GetVictim() != targetUnit ||
+                (petCreature->GetVictim() == targetUnit && !charmInfo->IsCommandAttack()))
+            {
+                if (petCreature->GetVictim())
+                    petCreature->AttackStop();
+
+                charmInfo->SetIsCommandAttack(true);
+                charmInfo->SetIsAtStay(false);
+                charmInfo->SetIsFollowing(false);
+                charmInfo->SetIsCommandFollow(false);
+                charmInfo->SetIsReturning(false);
+
+                if (petCreature->IsAIEnabled)
+                    petCreature->AI()->AttackStart(targetUnit);
+                else
+                    petCreature->Attack(targetUnit, true);
+
+                didAttack = true;
+            }
+        }
+
+        stance = GetHunterPetReactState(targets);
+        reason = didAttack ? "OK" : "FAILED";
+        return didAttack;
+    }
+
+    reason = "BAD_ACTION";
+    return false;
+}
+
+void SendHunterPetControlAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botName,
+    std::string const& action,
+    std::string const& stance,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << action
+        << kFieldSeparator << stance
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(requester, replyType, "HUNTER_PET_CONTROL_ACK", payload.str());
+}
+
+void RunHunterPetControlCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken,
+    std::string const& actionValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const botName = Trim(botNameValue);
+    std::string const action = ToUpper(Trim(actionValue));
+
+    if (!requester)
+        return;
+
+    if (!IsValidRequestToken(token))
+    {
+        SendHunterPetControlAck(requester, replyType, token, botName, action, "NONE", "BAD_TOKEN");
+        return;
+    }
+
+    if (botName.empty() || !IsAllowedHunterPetControlAction(action))
+    {
+        SendHunterPetControlAck(
+            requester, replyType, token, botName, action, "NONE",
+            botName.empty() ? "BAD_BOT" : "BAD_ACTION");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendHunterPetControlAck(requester, replyType, token, botName, action, "NONE", "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendHunterPetControlAck(requester, replyType, token, botName, action, "NONE", "REPLAY");
+        return;
+    }
+
+    Player* bot = nullptr;
+    PlayerbotAI* botAI = nullptr;
+    std::string reason;
+    if (!ResolveHunterPetControlBot(requester, botName, bot, botAI, reason))
+    {
+        SendHunterPetControlAck(requester, replyType, token, botName, action, "NONE", reason);
+        return;
+    }
+
+    std::string stance = "NONE";
+    bool const ok = ApplyHunterPetControl(requester, bot, botAI, action, stance, reason);
+    if (!ok && reason == "OK")
+        reason = "FAILED";
+
+    SendHunterPetControlAck(requester, replyType, token, botName, action, stance, reason);
+}
+// MB_HUNTER_PET_CONTROL_V1_END
+// MB_HUNTER_PET_MANAGE_V1_BEGIN
+bool IsAllowedHunterPetManageAction(std::string const& action)
+{
+    return action == "TAME_ID" ||
+        action == "TAME_FAMILY" ||
+        action == "RENAME" ||
+        action == "ABANDON" ||
+        action == "DISMISS" ||
+        action == "CALL";
+}
+
+bool HunterPetManageHasBeastMastery(Player* bot)
+{
+    return bot && bot->HasAura(53270);
+}
+
+bool CreateManagedHunterPet(
+    Player* bot,
+    uint32 creatureEntry,
+    uint32& resultEntry,
+    std::string& resultName,
+    std::string& reason)
+{
+    if (!bot || bot->getClass() != CLASS_HUNTER || bot->GetLevel() < 10)
+    {
+        reason = "LEVEL_TOO_LOW";
+        return false;
+    }
+
+    CreatureTemplate const* const creature = sObjectMgr->GetCreatureTemplate(creatureEntry);
+    if (!creature)
+    {
+        reason = "CREATURE_NOT_FOUND";
+        return false;
+    }
+
+    if (bot->GetPetStable() && bot->GetPetStable()->CurrentPet)
+    {
+        bot->RemovePet(nullptr, PET_SAVE_AS_CURRENT);
+        bot->RemovePet(nullptr, PET_SAVE_NOT_IN_SLOT);
+    }
+    if (bot->GetPetStable() && bot->GetPetStable()->GetUnslottedHunterPet())
+    {
+        bot->GetPetStable()->UnslottedPets.clear();
+        bot->RemovePet(nullptr, PET_SAVE_AS_CURRENT);
+        bot->RemovePet(nullptr, PET_SAVE_NOT_IN_SLOT);
+    }
+
+    Pet* const pet = bot->CreateTamedPetFrom(creatureEntry, 0);
+    if (!pet)
+    {
+        reason = "CREATE_FAILED";
+        return false;
+    }
+
+    pet->SetUInt32Value(UNIT_FIELD_LEVEL, bot->GetLevel() - 1);
+    pet->GetMap()->AddToMap(pet->ToCreature());
+    pet->SetUInt32Value(UNIT_FIELD_LEVEL, bot->GetLevel());
+    bot->SetMinion(pet, true);
+    pet->InitTalentForLevel();
+    pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+    bot->PetSpellInitialize();
+    pet->InitStatsForLevel(bot->GetLevel());
+    pet->SetLevel(bot->GetLevel());
+    pet->SetPower(POWER_HAPPINESS, pet->GetMaxPower(Powers(POWER_HAPPINESS)));
+    pet->SetHealth(pet->GetMaxHealth());
+
+    for (PetSpellMap::const_iterator itr = pet->m_spells.begin(); itr != pet->m_spells.end(); ++itr)
+    {
+        if (itr->second.state == PETSPELL_REMOVED)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(itr->first);
+        if (!spellInfo || spellInfo->IsPassive())
+            continue;
+
+        pet->ToggleAutocast(spellInfo, true);
+    }
+
+    resultEntry = creature->Entry;
+    resultName = creature->Name;
+    reason = "OK";
+    return true;
+}
+
+void RestoreHunterPetAutoCallStrategy(Player* bot, PlayerbotAI* botAI)
+{
+    if (!bot || !botAI)
+        return;
+
+    std::string const botKey = bot->GetName();
+    auto const itr = gHunterPetDismissedStrategyRestore.find(botKey);
+    if (itr == gHunterPetDismissedStrategyRestore.end())
+        return;
+
+    if (!botAI->HasStrategy("pet", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("+pet", BOT_STATE_NON_COMBAT);
+
+    gHunterPetDismissedStrategyRestore.erase(itr);
+}
+
+bool ApplyHunterPetManage(
+    Player* bot,
+    PlayerbotAI* botAI,
+    std::string const& action,
+    std::string const& argument,
+    uint32& resultEntry,
+    std::string& resultName,
+    std::string& reason)
+{
+    resultEntry = 0;
+    resultName.clear();
+
+    if (!bot || !botAI)
+    {
+        reason = "NO_AI";
+        return false;
+    }
+
+    if (action == "TAME_ID")
+    {
+        uint32 creatureEntry = 0;
+        if (!TryParseUint32Field(Trim(argument), 1, std::numeric_limits<uint32>::max(), creatureEntry))
+        {
+            reason = "BAD_ARGUMENT";
+            return false;
+        }
+
+        CreatureTemplate const* const creature = sObjectMgr->GetCreatureTemplate(creatureEntry);
+        if (!creature)
+        {
+            reason = "CREATURE_NOT_FOUND";
+            return false;
+        }
+        if (!creature->IsTameable(true))
+        {
+            reason = "NOT_TAMEABLE";
+            return false;
+        }
+        if (creature->IsExotic() && !HunterPetManageHasBeastMastery(bot))
+        {
+            reason = "EXOTIC_REQUIRES_BEAST_MASTERY";
+            return false;
+        }
+        if (!creature->IsTameable(bot->CanTameExoticPets()))
+        {
+            reason = "NOT_TAMEABLE";
+            return false;
+        }
+
+        return CreateManagedHunterPet(bot, creature->Entry, resultEntry, resultName, reason);
+    }
+
+    if (action == "TAME_FAMILY")
+    {
+        uint32 familyId = 0;
+        if (!TryParseUint32Field(Trim(argument), 1, std::numeric_limits<uint32>::max(), familyId))
+        {
+            reason = "BAD_ARGUMENT";
+            return false;
+        }
+
+        CreatureTemplateContainer const* const creatures = sObjectMgr->GetCreatureTemplates();
+        std::vector<CreatureTemplate const*> candidates;
+        bool foundExotic = false;
+
+        for (auto itr = creatures->begin(); itr != creatures->end(); ++itr)
+        {
+            CreatureTemplate const& creature = itr->second;
+            if (creature.family != familyId || !creature.IsTameable(true))
+                continue;
+
+            if (creature.IsExotic())
+            {
+                foundExotic = true;
+                if (!HunterPetManageHasBeastMastery(bot))
+                    continue;
+            }
+
+            if (!creature.IsTameable(bot->CanTameExoticPets()))
+                continue;
+
+            candidates.push_back(&creature);
+        }
+
+        if (candidates.empty())
+        {
+            reason = foundExotic && !HunterPetManageHasBeastMastery(bot)
+                ? "EXOTIC_REQUIRES_BEAST_MASTERY"
+                : "FAMILY_NOT_FOUND";
+            return false;
+        }
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<std::size_t> dis(0, candidates.size() - 1);
+        CreatureTemplate const* const selected = candidates[dis(gen)];
+        return CreateManagedHunterPet(bot, selected->Entry, resultEntry, resultName, reason);
+    }
+
+    if (action == "RENAME")
+    {
+        Pet* const pet = bot->GetPet();
+        if (!pet)
+        {
+            reason = "NO_PET";
+            return false;
+        }
+
+        if (argument.empty() || argument.length() > 12)
+        {
+            reason = "BAD_NAME";
+            return false;
+        }
+
+        for (char const c : argument)
+        {
+            if (!std::isalpha(static_cast<unsigned char>(c)))
+            {
+                reason = "BAD_NAME";
+                return false;
+            }
+        }
+
+        std::string normalized = argument;
+        normalized[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(normalized[0])));
+        for (std::size_t i = 1; i < normalized.size(); ++i)
+            normalized[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(normalized[i])));
+
+        if (sObjectMgr->IsReservedName(normalized))
+        {
+            reason = "RESERVED_NAME";
+            return false;
+        }
+
+        resultEntry = pet->GetEntry();
+        resultName = normalized;
+        pet->SetName(normalized);
+        pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+        bot->GetSession()->SendPetNameQuery(pet->GetGUID(), pet->GetEntry());
+        bot->RemovePet(nullptr, PET_SAVE_AS_CURRENT, true);
+
+        constexpr uint32 SPELL_CALL_PET = 883;
+        if (bot->HasSpell(SPELL_CALL_PET))
+            bot->CastSpell(bot, SPELL_CALL_PET, true);
+
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "DISMISS")
+    {
+        Pet* const pet = bot->GetPet();
+        std::string const botKey = bot->GetName();
+
+        if (!pet)
+        {
+            if (!bot->GetPetStable() || !bot->GetPetStable()->CurrentPet)
+            {
+                reason = "NO_PET";
+                return false;
+            }
+
+            if (botAI->HasStrategy("pet", BOT_STATE_NON_COMBAT))
+            {
+                botAI->ChangeStrategy("-pet", BOT_STATE_NON_COMBAT);
+                gHunterPetDismissedStrategyRestore.insert(botKey);
+            }
+
+            reason = "OK";
+            return true;
+        }
+
+        if (pet->getPetType() != HUNTER_PET)
+        {
+            reason = "NOT_HUNTER_PET";
+            return false;
+        }
+
+        resultEntry = pet->GetEntry();
+        resultName = pet->GetName();
+
+        bool const strategyWasEnabled = botAI->HasStrategy("pet", BOT_STATE_NON_COMBAT);
+        if (strategyWasEnabled)
+        {
+            botAI->ChangeStrategy("-pet", BOT_STATE_NON_COMBAT);
+            gHunterPetDismissedStrategyRestore.insert(botKey);
+        }
+
+        bot->RemovePet(nullptr, PET_SAVE_AS_CURRENT, true);
+        if (bot->GetPet())
+        {
+            if (strategyWasEnabled)
+                RestoreHunterPetAutoCallStrategy(bot, botAI);
+
+            reason = "FAILED";
+            return false;
+        }
+
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "CALL")
+    {
+        if (Pet* const pet = bot->GetPet())
+        {
+            if (pet->getPetType() != HUNTER_PET)
+            {
+                reason = "NOT_HUNTER_PET";
+                return false;
+            }
+
+            resultEntry = pet->GetEntry();
+            resultName = pet->GetName();
+            reason = "OK";
+            return true;
+        }
+
+        if (!bot->GetPetStable() || !bot->GetPetStable()->CurrentPet)
+        {
+            reason = "NO_PET";
+            return false;
+        }
+
+        constexpr uint32 SPELL_CALL_PET = 883;
+        if (!bot->HasSpell(SPELL_CALL_PET))
+        {
+            reason = "FAILED";
+            return false;
+        }
+
+        bot->CastSpell(bot, SPELL_CALL_PET, true);
+
+        if (Pet* const calledPet = bot->GetPet())
+        {
+            resultEntry = calledPet->GetEntry();
+            resultName = calledPet->GetName();
+        }
+
+        reason = "OK";
+        return true;
+    }
+
+    if (action == "ABANDON")
+    {
+        Pet* const pet = bot->GetPet();
+        if (!pet)
+        {
+            reason = "NO_PET";
+            return false;
+        }
+        if (pet->getPetType() != HUNTER_PET)
+        {
+            reason = "NOT_HUNTER_PET";
+            return false;
+        }
+
+        resultEntry = pet->GetEntry();
+        resultName = pet->GetName();
+        bot->RemovePet(pet, PET_SAVE_AS_DELETED);
+        reason = "OK";
+        return true;
+    }
+
+    reason = "BAD_ACTION";
+    return false;
+}
+
+void SendHunterPetManageAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& botName,
+    std::string const& action,
+    uint32 resultEntry,
+    std::string const& resultName,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << action
+        << kFieldSeparator << resultEntry
+        << kFieldSeparator << UrlEncodeField(resultName)
+        << kFieldSeparator << reason;
+
+    SendAddonPacket(requester, replyType, "HUNTER_PET_MANAGE_ACK", payload.str());
+}
+
+void RunHunterPetManageCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken,
+    std::string const& actionValue,
+    std::string const& argumentValue)
+{
+    std::string const token = Trim(requestToken);
+    std::string const botName = Trim(botNameValue);
+    std::string const action = ToUpper(Trim(actionValue));
+    std::string const argument = argumentValue;
+
+    if (!requester)
+        return;
+
+    if (!IsValidRequestToken(token))
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "BAD_TOKEN");
+        return;
+    }
+
+    if (botName.empty() || !IsAllowedHunterPetManageAction(action))
+    {
+        SendHunterPetManageAck(
+            requester, replyType, token, botName, action, 0, "",
+            botName.empty() ? "BAD_BOT" : "BAD_ACTION");
+        return;
+    }
+
+    if ((action == "TAME_ID" || action == "TAME_FAMILY" || action == "RENAME") && argument.empty())
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "BAD_ARGUMENT");
+        return;
+    }
+    if ((action == "ABANDON" || action == "DISMISS" || action == "CALL") && !argument.empty())
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "BAD_ARGUMENT");
+        return;
+    }
+
+    if (!ConsumeGroupOrderRateLimit(requester))
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "RATE_LIMIT");
+        return;
+    }
+
+    if (!RegisterGroupOrderToken(requester, token))
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "REPLAY");
+        return;
+    }
+
+    Player* bot = nullptr;
+    PlayerbotAI* botAI = nullptr;
+    std::string reason;
+    if (!ResolveHunterPetControlBot(requester, botName, bot, botAI, reason))
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", reason);
+        return;
+    }
+
+    uint32 resultEntry = 0;
+    std::string resultName;
+    bool const ok = ApplyHunterPetManage(bot, botAI, action, argument, resultEntry, resultName, reason);
+    if (!ok && reason == "OK")
+        reason = "FAILED";
+
+    if (ok && (action == "TAME_ID" || action == "TAME_FAMILY"))
+    {
+        PlayerbotFactory factory(bot, bot->GetLevel());
+        factory.InitPet();
+        factory.InitPetTalents();
+    }
+
+    if (ok && action != "DISMISS")
+        RestoreHunterPetAutoCallStrategy(bot, botAI);
+
+    SendHunterPetManageAck(requester, replyType, token, botName, action, resultEntry, resultName, reason);
+}
+// MB_HUNTER_PET_MANAGE_V1_END
 
 // MB_GROUP_ACTION_V1_BEGIN
 bool IsAllowedGroupAction(std::string const& action)
@@ -17440,6 +18310,81 @@ if (requestType == "ATTACK_ORDER")
     return true;
 }
 // MB_ATTACK_ORDER_V1_DISPATCH_END
+// MB_HUNTER_PET_CONTROL_V1_DISPATCH_BEGIN
+if (requestType == "HUNTER_PET_CONTROL")
+{
+    std::string const token = GetSafeErrorToken(fields, 2);
+    if (fields.size() != 4)
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+    if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+    std::string botName;
+    if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+        botName != Trim(botName) || botName.empty())
+    {
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+    }
+
+    if (!IsValidRequestToken(fields[2]))
+        return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+    std::string const action = ToUpper(Trim(fields[3]));
+    if (fields[3] != action || !IsAllowedHunterPetControlAction(action))
+    {
+        SendHunterPetControlAck(player, replyType, fields[2], botName, action, "NONE", "BAD_ACTION");
+        return true;
+    }
+
+    RunHunterPetControlCommand(player, replyType, botName, fields[2], action);
+    return true;
+}
+// MB_HUNTER_PET_CONTROL_V1_DISPATCH_END
+// MB_HUNTER_PET_MANAGE_V1_DISPATCH_BEGIN
+if (requestType == "HUNTER_PET_MANAGE")
+{
+    std::string const token = GetSafeErrorToken(fields, 2);
+    if (fields.size() != 5)
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+    if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+    std::string botName;
+    if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+        botName != Trim(botName) || botName.empty())
+    {
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+    }
+
+    if (!IsValidRequestToken(fields[2]))
+        return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+    std::string const action = ToUpper(Trim(fields[3]));
+    if (fields[3] != action || !IsAllowedHunterPetManageAction(action))
+    {
+        SendHunterPetManageAck(player, replyType, fields[2], botName, action, 0, "", "BAD_ACTION");
+        return true;
+    }
+
+    if (!IsValidEncodedField(fields[4], 96, true))
+    {
+        SendHunterPetManageAck(player, replyType, fields[2], botName, action, 0, "", "BAD_ARGUMENT");
+        return true;
+    }
+
+    std::string argument;
+    if (!TryUrlDecodeField(fields[4], argument, 96, true))
+    {
+        SendHunterPetManageAck(player, replyType, fields[2], botName, action, 0, "", "BAD_ARGUMENT");
+        return true;
+    }
+
+    RunHunterPetManageCommand(player, replyType, botName, fields[2], action, argument);
+    return true;
+}
+// MB_HUNTER_PET_MANAGE_V1_DISPATCH_END
 
     // MB_BOT_MAINTENANCE_V1_DISPATCH_BEGIN
     if (requestType == "BOT_MAINTENANCE")

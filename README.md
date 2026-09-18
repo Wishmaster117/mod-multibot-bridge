@@ -76,6 +76,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Enchanting** | Dedicated Enchanting Trade Service using the native Trade workflow. |
 | **Quests** | Structured quest data/abandon plus accept-all, talk, gameobject-use, reward and reward-policy endpoints. |
 | **Autogear** | `AUTOGEAR_OPTIONS_V1` provides server limits and a validated INFO/PLAN/APPLY workflow for quality/iLvl-based equipment generation. |
+| **Hunter Pet** | `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1` provide bounded pet control, tame/rename/abandon and temporary dismiss/call lifecycle handling. |
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
 | **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1`, bounded `GROUP_ACTION_V1` and `RTSC_ORDER_V1` endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
@@ -327,6 +328,24 @@ The PLAN step returns a bounded summary for user confirmation before APPLY perfo
 
 ---
 
+# Hunter Pet H1/H2/H3
+
+Hunter pet handling is exposed through three closed capability families:
+
+```text
+HUNTER_PET_CONTROL_V1
+HUNTER_PET_MANAGE_V1
+HUNTER_PET_LIFECYCLE_V1
+```
+
+H1 covers stance and direct control (`AGGRESSIVE`, `DEFENSIVE`, `PASSIVE`, `ATTACK`, `FOLLOW`, `STAY`). H2 covers `TAME_ID`, `TAME_FAMILY`, `RENAME` and destructive `ABANDON`. H3 separates temporary `DISMISS` from `CALL`.
+
+`DISMISS` stores the current Hunter pet with `PET_SAVE_AS_CURRENT` and temporarily disables the Playerbots non-combat `pet` strategy only when it was active. `CALL` invokes Hunter spell `883`; the Bridge restores `+pet` only when it previously removed that strategy. `ABANDON` remains the `PET_SAVE_AS_DELETED` path.
+
+The endpoint remains bounded and typed: no arbitrary Playerbots command executor was added. Runtime validation on **18 September 2026** covered tame, rename, abandon, repeated dismiss/call cycles and non-regression of H1 controls. `mod-playerbots` remained strictly read-only.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -403,6 +422,9 @@ QUEST_GAMEOBJECT_USE_V1
 QUEST_REWARD_V1
 QUEST_REWARD_POLICY_V1
 AUTOGEAR_OPTIONS_V1
+HUNTER_PET_CONTROL_V1
+HUNTER_PET_MANAGE_V1
+HUNTER_PET_LIFECYCLE_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -420,7 +442,7 @@ The exact packet schemas are implementation details shared with the addon and ma
 
 `mod-multibot-bridge` must be configured and compiled against the **current `master` revision of the official [`mod-playerbots`](https://github.com/mod-playerbots/mod-playerbots) repository**. Do not assume compatibility with an older checkout, an archived revision or an unrelated fork. Synchronize `modules/mod-playerbots` with the official repository before configuring/rebuilding the Bridge.
 
-Validated upstream revision on **17 September 2026**:
+Validated upstream revision on **18 September 2026**:
 
 ```text
 b6696bdbd3740e575598d167d69f39f68cc0b907
@@ -465,7 +487,7 @@ The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *
 
 Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Creator `init=auto` is also migrated through the bounded `CREATOR_INIT_AUTO_V1` target/group adapter. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are now present, and `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow. Remaining ordinary-bot actions and final legacy parser/fallback cleanup are the next migration areas.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are present, `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow, and Hunter Pet H1/H2/H3 is runtime validated through `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1`. The next ordinary-bot migration is spell cast, followed by final legacy parser/fallback cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
