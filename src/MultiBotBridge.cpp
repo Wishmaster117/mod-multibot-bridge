@@ -188,6 +188,18 @@ std::chrono::seconds constexpr kBotMaintenanceRateWindow(10);
 std::chrono::seconds constexpr kBotMaintenanceReplayTtl(30);
 std::size_t constexpr kBotMaintenanceMaxRecentTokens = 32;
 std::size_t constexpr kBotMaintenanceMaxRequesterStates = 512;
+std::size_t constexpr kSpellbookCastRateLimit = 8;
+std::chrono::milliseconds constexpr kSpellbookCastRateWindow(2000);
+std::chrono::seconds constexpr kSpellbookCastReplayTtl(10);
+std::size_t constexpr kSpellbookCastMaxRecentTokens = 32;
+std::size_t constexpr kSpellbookCastMaxRequesterStates = 512;
+std::size_t constexpr kSpellbookIgnoreRateLimit = 8;
+std::chrono::milliseconds constexpr kSpellbookIgnoreRateWindow(2000);
+std::chrono::seconds constexpr kSpellbookIgnoreReplayTtl(10);
+std::size_t constexpr kSpellbookIgnoreMaxRecentTokens = 32;
+std::size_t constexpr kSpellbookIgnoreMaxRequesterStates = 512;
+uint32 constexpr kSpellbookCastGravityLapseTk = 39432;
+uint32 constexpr kSpellbookCastGravityLapseMgt = 44226;
 std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
@@ -253,6 +265,8 @@ char const* const kQuestRewardCapability = "QUEST_REWARD_V1";
 char const* const kQuestRewardPolicyCapability = "QUEST_REWARD_POLICY_V1";
 char const* const kAutogearOptionsCapability = "AUTOGEAR_OPTIONS_V1";
 char const* const kBotMaintenanceCapability = "BOT_MAINTENANCE_V1";
+char const* const kSpellbookCastCapability = "SPELLBOOK_CAST_V1";
+char const* const kSpellbookIgnoreCapability = "SPELLBOOK_IGNORE_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -412,7 +426,9 @@ kQuestAcceptAllCapability,
         kQuestRewardCapability,
         kQuestRewardPolicyCapability,
         kAutogearOptionsCapability,
-        kBotMaintenanceCapability
+        kBotMaintenanceCapability,
+        kSpellbookCastCapability,
+        kSpellbookIgnoreCapability
     };
 
     std::vector<std::string> chunks;
@@ -4455,11 +4471,24 @@ void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string con
         return;
     }
 
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    AiObjectContext* const context = botAI ? botAI->GetAiObjectContext() : nullptr;
+    if (!context)
+    {
+        SendAddonPacket(requester, replyType, "SB_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
+        return;
+    }
+
+    std::set<uint32>& skipSpells = context->GetValue<std::set<uint32>&>("skip spells list")->Get();
     std::vector<SpellbookEntryData> const entries = BuildSpellbookEntries(bot);
     for (SpellbookEntryData const& entry : entries)
     {
+        bool const ignored = skipSpells.find(entry.spellId) != skipSpells.end();
         std::ostringstream payload;
-        payload << bot->GetName() << kFieldSeparator << requestToken << kFieldSeparator << entry.spellId;
+        payload << bot->GetName()
+            << kFieldSeparator << requestToken
+            << kFieldSeparator << entry.spellId
+            << kFieldSeparator << (ignored ? 1 : 0);
         SendAddonPacket(requester, replyType, "SB_ITEM", payload.str());
     }
 
@@ -13361,6 +13390,480 @@ bool HandleAutogearRequest(Player* requester, ChatMsg replyType,
 }
 // MB_AUTOGEAR_OPTIONS_V1_END
 
+// MB_SPELLBOOK_CAST_V1_BEGIN
+struct SpellbookCastRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::unordered_map<uint64, SpellbookCastRequestState> gSpellbookCastRequestStates;
+
+void PruneSpellbookCastRequestState(
+    SpellbookCastRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kSpellbookCastRateWindow)
+        state.requests.pop_front();
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kSpellbookCastReplayTtl)
+        state.recentTokens.pop_front();
+
+    while (state.recentTokens.size() > kSpellbookCastMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+SpellbookCastRequestState* GetSpellbookCastRequestState(Player* requester)
+{
+    if (!requester)
+        return nullptr;
+
+    auto const now = std::chrono::steady_clock::now();
+    uint64 const key = requester->GetGUID().GetCounter();
+    auto stateIt = gSpellbookCastRequestStates.find(key);
+
+    if (stateIt == gSpellbookCastRequestStates.end())
+    {
+        if (gSpellbookCastRequestStates.size() >= kSpellbookCastMaxRequesterStates)
+        {
+            for (auto it = gSpellbookCastRequestStates.begin(); it != gSpellbookCastRequestStates.end();)
+            {
+                PruneSpellbookCastRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = gSpellbookCastRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (gSpellbookCastRequestStates.size() >= kSpellbookCastMaxRequesterStates)
+            return nullptr;
+
+        stateIt = gSpellbookCastRequestStates.emplace(key, SpellbookCastRequestState{}).first;
+    }
+
+    PruneSpellbookCastRequestState(stateIt->second, now);
+    return &stateIt->second;
+}
+
+bool ConsumeSpellbookCastRateLimit(Player* requester)
+{
+    SpellbookCastRequestState* const state = GetSpellbookCastRequestState(requester);
+    if (!state)
+        return false;
+
+    if (state->requests.size() >= kSpellbookCastRateLimit)
+        return false;
+
+    state->requests.push_back(std::chrono::steady_clock::now());
+    return true;
+}
+
+bool RegisterSpellbookCastToken(Player* requester, std::string const& token)
+{
+    SpellbookCastRequestState* const state = GetSpellbookCastRequestState(requester);
+    if (!state)
+        return false;
+
+    for (auto const& entry : state->recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state->recentTokens.emplace_back(token, std::chrono::steady_clock::now());
+    while (state->recentTokens.size() > kSpellbookCastMaxRecentTokens)
+        state->recentTokens.pop_front();
+    return true;
+}
+
+bool IsSpellbookCastSpell(Player* bot, uint32 spellId)
+{
+    if (!bot || !spellId)
+        return false;
+
+    std::vector<SpellbookEntryData> const entries = BuildSpellbookEntries(bot);
+    for (SpellbookEntryData const& entry : entries)
+        if (entry.spellId == spellId)
+            return true;
+
+    return false;
+}
+
+void SendSpellbookCastAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    uint32 spellId,
+    bool ok,
+    std::string const& targetName,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << spellId
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(targetName)
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    std::string payloadText = payload.str();
+    if (!IsAddonPacketWithinBudget("SPELLBOOK_CAST_ACK", payloadText))
+    {
+        std::ostringstream compact;
+        compact << token
+            << kFieldSeparator << spellId
+            << kFieldSeparator << (ok ? "OK" : "ERR")
+            << kFieldSeparator
+            << kFieldSeparator << UrlEncodeField(reason);
+        payloadText = compact.str();
+    }
+
+    SendAddonPacket(requester, replyType, "SPELLBOOK_CAST_ACK", payloadText);
+}
+
+std::string DiagnoseSpellbookCastFailure(Player* bot, SpellInfo const* spellInfo, Unit* target)
+{
+    if (!bot || !spellInfo || !target)
+        return "CANNOT_CAST";
+
+    Spell spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    targets.SetUnitTarget(target);
+    spell.InitExplicitTargets(targets);
+
+    std::string const reason = GetSpellCastFailureReason(spell.CheckCast(true));
+    return reason == "OK" ? "CANNOT_CAST" : reason;
+}
+
+bool ApplySpellbookCast(
+    Player* requester,
+    Player* bot,
+    PlayerbotAI* botAI,
+    uint32 spellId,
+    std::string& targetName,
+    std::string& reason)
+{
+    targetName.clear();
+    reason = "BAD_REQUEST";
+
+    if (!requester || !bot || !botAI || !spellId)
+        return false;
+
+    if (!IsSpellbookCastSpell(bot, spellId))
+    {
+        reason = "SPELL_NOT_ALLOWED";
+        return false;
+    }
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || spellInfo->IsPassive())
+    {
+        reason = "BAD_SPELL";
+        return false;
+    }
+
+    if ((spellInfo->Targets & TARGET_FLAG_ITEM) ||
+        (spellInfo->Targets & TARGET_FLAG_GAMEOBJECT_ITEM) ||
+        spellInfo->Effects[0].Effect == SPELL_EFFECT_OPEN_LOCK ||
+        spellInfo->Effects[0].Effect == SPELL_EFFECT_SKINNING)
+    {
+        reason = "UNSUPPORTED_TARGET";
+        return false;
+    }
+
+    if (bot->GetTradeData())
+    {
+        reason = "TRADE_ACTIVE";
+        return false;
+    }
+
+    if (Pet* const pet = bot->GetPet())
+    {
+        if (pet->HasSpell(spellId))
+        {
+            reason = "PET_SPELL_NOT_ALLOWED";
+            return false;
+        }
+    }
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+    {
+        reason = "LOST_CONTROL";
+        return false;
+    }
+
+    if ((bot->IsFlying() && !bot->HasAura(kSpellbookCastGravityLapseTk) && !bot->HasAura(kSpellbookCastGravityLapseMgt)) ||
+        bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+    {
+        reason = "IN_FLIGHT";
+        return false;
+    }
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+    {
+        reason = "CHANNELING";
+        return false;
+    }
+
+    if (bot->HasSpellCooldown(spellId))
+    {
+        reason = "NOT_READY";
+        return false;
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+    {
+        reason = "MOVING";
+        return false;
+    }
+
+    Unit* target = nullptr;
+    if (requester->GetTarget())
+        target = botAI->GetUnit(requester->GetTarget());
+    if (!target || !target->IsInWorld())
+        target = bot;
+
+    targetName = target->GetName();
+
+    if (!botAI->CanCastSpell(spellId, target, true))
+    {
+        reason = DiagnoseSpellbookCastFailure(bot, spellInfo, target);
+        return false;
+    }
+
+    bool const debugSpellWasEnabled = botAI->HasStrategy("debug spell", BOT_STATE_NON_COMBAT);
+    if (debugSpellWasEnabled)
+        botAI->ChangeStrategy("-debug spell", BOT_STATE_NON_COMBAT);
+
+    bool const castStarted = botAI->CastSpell(spellId, target);
+
+    if (debugSpellWasEnabled && !botAI->HasStrategy("debug spell", BOT_STATE_NON_COMBAT))
+        botAI->ChangeStrategy("+debug spell", BOT_STATE_NON_COMBAT);
+
+    reason = castStarted ? "OK" : DiagnoseSpellbookCastFailure(bot, spellInfo, target);
+    return castStarted;
+}
+
+void RunSpellbookCastCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken,
+    uint32 spellId)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    std::string targetName;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (!ConsumeSpellbookCastRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterSpellbookCastToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (bot == requester)
+        reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else
+        ok = ApplySpellbookCast(requester, bot, botAI, spellId, targetName, reason);
+
+    SendSpellbookCastAck(requester, replyType, token, spellId, ok, targetName, reason);
+}
+// MB_SPELLBOOK_CAST_V1_END
+// MB_SPELLBOOK_IGNORE_V1_BEGIN
+struct SpellbookIgnoreRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::unordered_map<uint64, SpellbookIgnoreRequestState> gSpellbookIgnoreRequestStates;
+
+void PruneSpellbookIgnoreRequestState(
+    SpellbookIgnoreRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kSpellbookIgnoreRateWindow)
+        state.requests.pop_front();
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kSpellbookIgnoreReplayTtl)
+        state.recentTokens.pop_front();
+
+    while (state.recentTokens.size() > kSpellbookIgnoreMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+SpellbookIgnoreRequestState* GetSpellbookIgnoreRequestState(Player* requester)
+{
+    if (!requester)
+        return nullptr;
+
+    auto const now = std::chrono::steady_clock::now();
+    uint64 const key = requester->GetGUID().GetCounter();
+    auto stateIt = gSpellbookIgnoreRequestStates.find(key);
+
+    if (stateIt == gSpellbookIgnoreRequestStates.end())
+    {
+        if (gSpellbookIgnoreRequestStates.size() >= kSpellbookIgnoreMaxRequesterStates)
+        {
+            for (auto it = gSpellbookIgnoreRequestStates.begin(); it != gSpellbookIgnoreRequestStates.end();)
+            {
+                PruneSpellbookIgnoreRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = gSpellbookIgnoreRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (gSpellbookIgnoreRequestStates.size() >= kSpellbookIgnoreMaxRequesterStates)
+            return nullptr;
+
+        stateIt = gSpellbookIgnoreRequestStates.emplace(key, SpellbookIgnoreRequestState{}).first;
+    }
+
+    PruneSpellbookIgnoreRequestState(stateIt->second, now);
+    return &stateIt->second;
+}
+
+bool ConsumeSpellbookIgnoreRateLimit(Player* requester)
+{
+    SpellbookIgnoreRequestState* const state = GetSpellbookIgnoreRequestState(requester);
+    if (!state)
+        return false;
+
+    if (state->requests.size() >= kSpellbookIgnoreRateLimit)
+        return false;
+
+    state->requests.push_back(std::chrono::steady_clock::now());
+    return true;
+}
+
+bool RegisterSpellbookIgnoreToken(Player* requester, std::string const& token)
+{
+    SpellbookIgnoreRequestState* const state = GetSpellbookIgnoreRequestState(requester);
+    if (!state)
+        return false;
+
+    for (auto const& entry : state->recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state->recentTokens.emplace_back(token, std::chrono::steady_clock::now());
+    while (state->recentTokens.size() > kSpellbookIgnoreMaxRecentTokens)
+        state->recentTokens.pop_front();
+    return true;
+}
+
+void SendSpellbookIgnoreAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    uint32 spellId,
+    std::string const& action,
+    bool ok,
+    bool ignored,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << spellId
+        << kFieldSeparator << action
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << (ignored ? 1 : 0)
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "SPELLBOOK_IGNORE_ACK", payload.str());
+}
+
+void RunSpellbookIgnoreCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken,
+    uint32 spellId,
+    std::string const& actionValue)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    std::string const action = Trim(actionValue);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    bool ignored = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession())
+        reason = "NO_SESSION";
+    else if (!ConsumeSpellbookIgnoreRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterSpellbookIgnoreToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (bot == requester)
+        reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else if (!IsSpellbookCastSpell(bot, spellId))
+        reason = "SPELL_NOT_ALLOWED";
+    else if (action != "IGNORE" && action != "ALLOW")
+        reason = "BAD_REQUEST";
+    else
+    {
+        AiObjectContext* const context = botAI->GetAiObjectContext();
+        if (!context)
+            reason = "NO_CONTEXT";
+        else
+        {
+            std::set<uint32>& skipSpells =
+                context->GetValue<std::set<uint32>&>("skip spells list")->Get();
+
+            bool const wantIgnored = action == "IGNORE";
+            bool const wasIgnored = skipSpells.find(spellId) != skipSpells.end();
+
+            if (wantIgnored != wasIgnored)
+            {
+                if (wantIgnored)
+                    skipSpells.insert(spellId);
+                else
+                    skipSpells.erase(spellId);
+
+                PlayerbotRepository::instance().Save(botAI);
+            }
+
+            ignored = skipSpells.find(spellId) != skipSpells.end();
+            ok = ignored == wantIgnored;
+            reason = ok ? "OK" : "FAILED";
+        }
+    }
+
+    SendSpellbookIgnoreAck(requester, replyType, token, spellId, action, ok, ignored, reason);
+}
+// MB_SPELLBOOK_IGNORE_V1_END
+
 // MB_BOT_MAINTENANCE_V1_BEGIN
 struct BotMaintenanceRequestState
 {
@@ -18310,6 +18813,65 @@ if (requestType == "ATTACK_ORDER")
     return true;
 }
 // MB_ATTACK_ORDER_V1_DISPATCH_END
+// MB_SPELLBOOK_CAST_V1_DISPATCH_BEGIN
+if (requestType == "SPELLBOOK_CAST")
+{
+    std::string const token = GetSafeErrorToken(fields, 2);
+    if (fields.size() != 4)
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+    if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+    std::string botName;
+    if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+        botName != Trim(botName) || botName.empty())
+    {
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+    }
+
+    if (!IsValidRequestToken(fields[2]))
+        return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+    uint32 spellId = 0;
+    if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), spellId))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+    RunSpellbookCastCommand(player, replyType, botName, fields[2], spellId);
+    return true;
+}
+// MB_SPELLBOOK_CAST_V1_DISPATCH_END
+// MB_SPELLBOOK_IGNORE_V1_DISPATCH_BEGIN
+if (requestType == "SPELLBOOK_IGNORE")
+{
+    std::string const token = GetSafeErrorToken(fields, 2);
+    if (fields.size() != 5)
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+    if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+    std::string botName;
+    if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+        botName != Trim(botName) || botName.empty())
+    {
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+    }
+
+    if (!IsValidRequestToken(fields[2]))
+        return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+    uint32 spellId = 0;
+    if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), spellId))
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+    if (fields[4] != "IGNORE" && fields[4] != "ALLOW")
+        return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ACTION");
+
+    RunSpellbookIgnoreCommand(player, replyType, botName, fields[2], spellId, fields[4]);
+    return true;
+}
+// MB_SPELLBOOK_IGNORE_V1_DISPATCH_END
 // MB_HUNTER_PET_CONTROL_V1_DISPATCH_BEGIN
 if (requestType == "HUNTER_PET_CONTROL")
 {

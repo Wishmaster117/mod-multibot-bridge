@@ -80,7 +80,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Loot** | Loot-profile control and persistent exact always-loot item rules. |
 | **Group tools** | Formation, Roll and other migrated controls, plus dedicated `FOLLOW_ORDER_V1`, `STAY_ORDER_V1`, `ATTACK_ORDER_V1`, `FLEE_ORDER_V1`, bounded `GROUP_ACTION_V1` and `RTSC_ORDER_V1` endpoints. |
 | **SelfBot** | Dedicated SelfBot state, strategy and selected action endpoints. |
-| **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook and related data. |
+| **Character information** | Stats, PvP stats, skills, reputations, currencies/emblems, spellbook snapshots plus specialized cast/ignored-spell endpoints, and related data. |
 | **Outfits** | Structured outfit listing and actions. |
 
 ---
@@ -346,6 +346,23 @@ The endpoint remains bounded and typed: no arbitrary Playerbots command executor
 
 ---
 
+# Spellbook Cast / Ignore
+
+Spellbook write actions are exposed through two specialized capability families:
+
+```text
+SPELLBOOK_CAST_V1
+SPELLBOOK_IGNORE_V1
+```
+
+`SPELLBOOK_CAST_V1` validates requester, controlled bot, session/world state and the requested numeric `spellId`, then uses the dedicated cast path and returns a structured result. The Bridge does not expose a generic `RUN~CAST_SPELL` or arbitrary Playerbots command executor.
+
+`SPELLBOOK_IGNORE_V1` accepts only typed `IGNORE` / `ALLOW` operations for a validated `spellId`. It updates the existing Playerbots ignored-spell state directly instead of routing through the legacy `ss +/-` chat command path. The authoritative ignored state is included in the Spellbook snapshot and confirmed through structured ACKs.
+
+Runtime validation on **19 September 2026** covered cast, ignore/allow, localized client feedback and the filtered ignored-spell view. The Bridge remains the primary adaptation layer and `mod-playerbots` remains strictly read-only.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -425,6 +442,8 @@ AUTOGEAR_OPTIONS_V1
 HUNTER_PET_CONTROL_V1
 HUNTER_PET_MANAGE_V1
 HUNTER_PET_LIFECYCLE_V1
+SPELLBOOK_CAST_V1
+SPELLBOOK_IGNORE_V1
 ```
 
 The exact packet schemas are implementation details shared with the addon and may evolve with negotiated capability versions.
@@ -487,7 +506,7 @@ The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *
 
 Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Creator `init=auto` is also migrated through the bounded `CREATOR_INIT_AUTO_V1` target/group adapter. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are present, `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow, and Hunter Pet H1/H2/H3 is runtime validated through `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1`. The next ordinary-bot migration is spell cast, followed by final legacy parser/fallback cleanup.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are present, `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow, Hunter Pet H1/H2/H3 is runtime validated through `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1`, and Spellbook Cast / Ignore is runtime validated through `SPELLBOOK_CAST_V1` and `SPELLBOOK_IGNORE_V1`. The remaining active work is the explicitly deferred technical residuals followed by final legacy parser/fallback cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 
