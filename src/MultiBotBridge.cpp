@@ -32,6 +32,7 @@
 #include "ReputationMgr.h"
 #include "AttackAction.h"
 #include "AiObjectContext.h"
+#include "AiFactory.h"
 #include "Event.h"
 #include "EventProcessor.h"
 #include "Trigger.h"
@@ -12022,6 +12023,65 @@ bool ConsumeStrategyMutationRateLimit(Player* requester)
     return true;
 }
 
+bool ResolveRogueDpsStrategyAlias(
+    Player* bot,
+    BotState botState,
+    std::string const& changes,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& resolvedChanges,
+    std::vector<StrategyMutationOperation>& resolvedOperations)
+{
+    resolvedChanges = changes;
+    resolvedOperations = operations;
+
+    if (!bot || botState != BOT_STATE_COMBAT || bot->getClass() != CLASS_ROGUE)
+        return true;
+
+    bool hasDpsAlias = false;
+    for (StrategyMutationOperation const& operation : operations)
+    {
+        if (operation.name == "dps")
+        {
+            hasDpsAlias = true;
+            break;
+        }
+    }
+
+    if (!hasDpsAlias)
+        return true;
+
+    std::string strategyName;
+    switch (AiFactory::GetPlayerSpecTab(bot))
+    {
+        case ROGUE_TAB_COMBAT:
+            strategyName = "combat";
+            break;
+        case ROGUE_TAB_ASSASSINATION:
+        case ROGUE_TAB_SUBTLETY:
+            strategyName = "assassin";
+            break;
+        default:
+            return false;
+    }
+
+    std::ostringstream normalized;
+    bool first = true;
+    for (StrategyMutationOperation& operation : resolvedOperations)
+    {
+        if (operation.name == "dps")
+            operation.name = strategyName;
+
+        if (!first)
+            normalized << ',';
+
+        normalized << (operation.enable ? '+' : '-') << operation.name;
+        first = false;
+    }
+
+    resolvedChanges = normalized.str();
+    return !resolvedChanges.empty() && resolvedChanges.size() <= kMaxCommandLength;
+}
+
 bool VerifyStrategyMutationResult(
     PlayerbotAI* botAI,
     BotState botState,
@@ -12305,7 +12365,15 @@ bool ApplyNativeStrategyMutation(
         return false;
     }
 
-    bool const isWarlockStoneMutation = IsWarlockStoneStrategyMutation(bot, botState, operations);
+    std::string resolvedChanges;
+    std::vector<StrategyMutationOperation> resolvedOperations;
+    if (!ResolveRogueDpsStrategyAlias(
+            bot, botState, changes, operations, resolvedChanges, resolvedOperations))
+    {
+        return false;
+    }
+
+    bool const isWarlockStoneMutation = IsWarlockStoneStrategyMutation(bot, botState, resolvedOperations);
     if (isWarlockStoneMutation && bot->IsInCombat())
     {
         if (BridgeConsoleLogsEnabled())
@@ -12320,17 +12388,17 @@ bool ApplyNativeStrategyMutation(
 
     std::map<std::string, bool> priorStrategyStates;
     if (isWarlockStoneMutation)
-        priorStrategyStates = CaptureStrategyMutationState(botAI, botState, operations);
+        priorStrategyStates = CaptureStrategyMutationState(botAI, botState, resolvedOperations);
 
     bool const hadFirestoneStrategy =
         botState == BOT_STATE_NON_COMBAT && botAI->HasStrategy("firestone", BOT_STATE_NON_COMBAT);
     bool const hadSpellstoneStrategy =
         botState == BOT_STATE_NON_COMBAT && botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
 
-    if (!botAI->DoSpecificAction(actionName, Event(actionName, changes, requester), true))
+    if (!botAI->DoSpecificAction(actionName, Event(actionName, resolvedChanges, requester), true))
         return false;
 
-    if (!VerifyStrategyMutationResult(botAI, botState, operations))
+    if (!VerifyStrategyMutationResult(botAI, botState, resolvedOperations))
         return false;
 
     WarlockStoneSwitchResult const stoneSwitchResult = TryForceWarlockStoneSwitch(
