@@ -4836,29 +4836,58 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
         return;
     }
 
-    std::vector<TrainerSpellEntryData> const entries = BuildTrainerSpellEntries(bot, trainerCreature);
     uint32 learnedCount = 0;
     uint32 spent = 0;
     std::string reason = "NO_MATCHING_SPELL";
 
-    for (TrainerSpellEntryData const& entry : entries)
+    if (learnAll)
     {
-        if (!learnAll && entry.spellId != requestedSpellId)
-            continue;
-
-        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
-        std::string learnReason;
-        if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+        uint32 const maxPasses = static_cast<uint32>(trainer->GetSpells().size());
+        for (uint32 pass = 0; pass < maxPasses; ++pass)
         {
-            ++learnedCount;
-            spent += entry.cost;
-            reason = "OK";
-        }
-        else if (learnReason != "OK" && learnedCount == 0)
-            reason = learnReason;
+            std::vector<TrainerSpellEntryData> const entries = BuildTrainerSpellEntries(bot, trainerCreature);
+            uint32 learnedThisPass = 0;
 
-        if (!learnAll)
+            for (TrainerSpellEntryData const& entry : entries)
+            {
+                SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
+                std::string learnReason;
+                if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+                {
+                    ++learnedCount;
+                    ++learnedThisPass;
+                    spent += entry.cost;
+                    reason = "OK";
+                }
+                else if (learnReason != "OK" && learnedCount == 0)
+                    reason = learnReason;
+            }
+
+            if (learnedThisPass == 0)
+                break;
+        }
+    }
+    else
+    {
+        std::vector<TrainerSpellEntryData> const entries = BuildTrainerSpellEntries(bot, trainerCreature);
+        for (TrainerSpellEntryData const& entry : entries)
+        {
+            if (entry.spellId != requestedSpellId)
+                continue;
+
+            SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
+            std::string learnReason;
+            if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+            {
+                ++learnedCount;
+                spent += entry.cost;
+                reason = "OK";
+            }
+            else if (learnReason != "OK")
+                reason = learnReason;
+
             break;
+        }
     }
 
     SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, learnedCount > 0, reason, learnedCount, spent);
