@@ -216,6 +216,9 @@ std::size_t constexpr kMaxGroupRollItemLinkLength = 160;
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
+char const* const kOutfitFramingCapability = "OUTFIT_FRAMING_V1";
+std::size_t constexpr kMaxOutfitFrameSets = 128;
+std::size_t constexpr kMaxOutfitFramePartsPerSet = 128;
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
@@ -304,6 +307,7 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
 bool SendStateAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload);
 bool SendProtocolError(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& requestType, std::string const& token, std::string const& reason);
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+bool SendOutfitFramedPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunInventoryItemMoveCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount, uint8 dstBag, uint8 dstSlot, uint32 dstItemId, uint32 dstCount);
 void RunInventoryItemTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint8 srcBag, uint8 srcSlot, uint32 srcItemId, uint32 srcCount);
@@ -381,6 +385,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kStateFramingCapability,
         kStrategyMutationCapability,
         kOutfitCapability,
+        kOutfitFramingCapability,
         kInventoryCapability,
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
@@ -5029,7 +5034,7 @@ void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& 
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Trim(requestToken);
 
-    SendAddonPacket(requester, replyType, "OUTFITS_BEGIN", headerPayload);
+    SendStateAddonPacket(requester, replyType, "OUTFITS_BEGIN", headerPayload);
 
     if (bot)
     {
@@ -5041,11 +5046,102 @@ void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& 
                 << kFieldSeparator << Trim(requestToken)
                 << kFieldSeparator << UrlEncodeField(BuildOutfitRawLine(outfit));
 
-            SendAddonPacket(requester, replyType, "OUTFITS_ITEM", payload.str());
+            SendStateAddonPacket(requester, replyType, "OUTFITS_ITEM", payload.str());
         }
     }
 
-    SendAddonPacket(requester, replyType, "OUTFITS_END", headerPayload);
+    SendStateAddonPacket(requester, replyType, "OUTFITS_END", headerPayload);
+}
+
+bool AppendOutfitFramedPacket(
+    std::vector<std::pair<std::string, std::string>>& packets,
+    std::string const& opcode,
+    std::string const& payload)
+{
+    if (!IsAddonPacketWithinBudget(opcode, payload))
+        return false;
+
+    packets.emplace_back(opcode, payload);
+    return true;
+}
+
+bool SendOutfitFramedPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::vector<OutfitSetSnapshot> const outfits = bot ? BuildOutfitSnapshots(bot) : std::vector<OutfitSetSnapshot>();
+
+    if (outfits.size() > kMaxOutfitFrameSets)
+        return false;
+
+    std::string const encodedBotName = UrlEncodeField(effectiveBotName);
+    std::string const token = Trim(requestToken);
+    std::vector<std::pair<std::string, std::string>> packets;
+
+    std::ostringstream beginPayload;
+    beginPayload << encodedBotName
+        << kFieldSeparator << token
+        << kFieldSeparator << outfits.size();
+    if (!AppendOutfitFramedPacket(packets, "OUTFITS_FBEGIN", beginPayload.str()))
+        return false;
+
+    for (std::size_t outfitOffset = 0; outfitOffset < outfits.size(); ++outfitOffset)
+    {
+        std::string const encodedLine = UrlEncodeField(BuildOutfitRawLine(outfits[outfitOffset]));
+        std::size_t encodedOffset = 0;
+        std::size_t partIndex = 1;
+
+        while (encodedOffset < encodedLine.size())
+        {
+            if (partIndex > kMaxOutfitFramePartsPerSet)
+                return false;
+
+            std::size_t chunkLength = std::min<std::size_t>(
+                kMaxEncodedFieldLength,
+                encodedLine.size() - encodedOffset);
+
+            std::string partPayload;
+            while (chunkLength > 0)
+            {
+                bool const isFinal = encodedOffset + chunkLength == encodedLine.size();
+                std::ostringstream payload;
+                payload << encodedBotName
+                    << kFieldSeparator << token
+                    << kFieldSeparator << (outfitOffset + 1)
+                    << kFieldSeparator << partIndex
+                    << kFieldSeparator << (isFinal ? 1 : 0)
+                    << kFieldSeparator << encodedLine.substr(encodedOffset, chunkLength);
+
+                partPayload = payload.str();
+                if (IsAddonPacketWithinBudget("OUTFITS_FPART", partPayload))
+                    break;
+
+                --chunkLength;
+            }
+
+            if (chunkLength == 0 || !AppendOutfitFramedPacket(packets, "OUTFITS_FPART", partPayload))
+                return false;
+
+            encodedOffset += chunkLength;
+            ++partIndex;
+        }
+    }
+
+    std::ostringstream endPayload;
+    endPayload << encodedBotName
+        << kFieldSeparator << token
+        << kFieldSeparator << outfits.size();
+    if (!AppendOutfitFramedPacket(packets, "OUTFITS_FEND", endPayload.str()))
+        return false;
+
+    for (std::pair<std::string, std::string> const& packet : packets)
+    {
+        if (!SendStateAddonPacket(requester, replyType, packet.first, packet.second))
+            return false;
+    }
+
+    return true;
 }
 
 struct OutfitCommandParts
@@ -5228,9 +5324,9 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix, bool
             return nullptr;
         };
 
-        auto equipItemByEntry = [bot, botAI, &findItemByEntry](uint32 itemEntry) -> bool
+        auto equipItemByEntry = [bot, &findItemByEntry](uint32 itemEntry) -> bool
         {
-            if (!bot || !bot->GetSession() || !botAI || !itemEntry)
+            if (!bot || !bot->GetSession() || !itemEntry)
                 return false;
 
             Item* const item = findItemByEntry(itemEntry);
@@ -5250,64 +5346,71 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix, bool
             if (itemProto->Class == ITEM_CLASS_CONTAINER)
                 return false;
 
-            uint8 dstSlot = NULL_SLOT;
-            if (itemProto->InventoryType == INVTYPE_RANGED || itemProto->InventoryType == INVTYPE_THROWN || itemProto->InventoryType == INVTYPE_RANGEDRIGHT)
-                dstSlot = EQUIPMENT_SLOT_RANGED;
-            else
-                dstSlot = botAI->FindEquipSlot(itemProto, NULL_SLOT, true);
-
-            if (dstSlot == NULL_SLOT)
-                return false;
-
-            if ((dstSlot == EQUIPMENT_SLOT_FINGER1 || dstSlot == EQUIPMENT_SLOT_TRINKET1)
-                && bot->GetItemByPos(INVENTORY_SLOT_BAG_0, dstSlot)
-                && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, dstSlot + 1))
+            if (item->GetBagSlot() == INVENTORY_SLOT_BAG_0 &&
+                item->GetSlot() >= EQUIPMENT_SLOT_START &&
+                item->GetSlot() < EQUIPMENT_SLOT_END)
             {
-                ++dstSlot;
+                return true;
             }
 
-            if (item->GetBagSlot() == INVENTORY_SLOT_BAG_0 && item->GetSlot() == dstSlot)
-                return true;
+            ObjectGuid const itemGuid = item->GetGUID();
+            uint8 const sourceBag = item->GetBagSlot();
+            uint8 const sourceSlot = item->GetSlot();
 
-            WorldPacket packet(CMSG_AUTOEQUIP_ITEM_SLOT, 2);
-            ObjectGuid itemGuid = item->GetGUID();
-            packet << itemGuid << dstSlot;
+            WorldPacket packet(CMSG_AUTOEQUIP_ITEM, 2);
+            packet << sourceBag << sourceSlot;
 
-            WorldPackets::Item::AutoEquipItemSlot nicePacket(std::move(packet));
+            WorldPackets::Item::AutoEquipItem nicePacket(std::move(packet));
             nicePacket.Read();
-            bot->GetSession()->HandleAutoEquipItemSlotOpcode(nicePacket);
-            return true;
+            bot->GetSession()->HandleAutoEquipItemOpcode(nicePacket);
+
+            Item* const equippedItem = bot->GetItemByGuid(itemGuid);
+            return equippedItem &&
+                equippedItem->GetBagSlot() == INVENTORY_SLOT_BAG_0 &&
+                equippedItem->GetSlot() >= EQUIPMENT_SLOT_START &&
+                equippedItem->GetSlot() < EQUIPMENT_SLOT_END;
         };
 
         if (parts.action == "REPLACE")
         {
             for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
             {
-                Item const* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
                 if (!item)
                     continue;
 
-                uint8 const bagIndex = item->GetBagSlot();
-                uint8 const dstBag = NULL_BAG;
+                uint16 const sourcePos = item->GetPos();
+                if (bot->CanUnequipItem(sourcePos, true) != EQUIP_ERR_OK)
+                    return false;
+
+                ItemPosCountVec destination;
+                if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, destination, item, false) != EQUIP_ERR_OK)
+                    return false;
+
+                ObjectGuid const itemGuid = item->GetGUID();
 
                 WorldPacket packet(CMSG_AUTOSTORE_BAG_ITEM, 3);
-                packet << bagIndex << slot << dstBag;
+                packet << uint8(INVENTORY_SLOT_BAG_0) << slot << uint8(NULL_BAG);
 
                 WorldPackets::Item::AutoStoreBagItem nicePacket(std::move(packet));
                 nicePacket.Read();
                 bot->GetSession()->HandleAutoStoreBagItemOpcode(nicePacket);
+
+                Item* const storedItem = bot->GetItemByGuid(itemGuid);
+                if (!storedItem ||
+                    bot->IsEquipmentPos(storedItem->GetPos()) ||
+                    !IsInventoryItemUnequipDestinationPositionAllowed(bot, storedItem->GetBagSlot(), storedItem->GetSlot()))
+                {
+                    return false;
+                }
             }
         }
 
-        bool equippedAny = false;
         for (uint32 const itemEntry : entries)
         {
-            if (equipItemByEntry(itemEntry))
-                equippedAny = true;
+            if (!equipItemByEntry(itemEntry))
+                return false;
         }
-
-        if (!equippedAny)
-            return false;
 
         return true;
     }
@@ -17609,7 +17712,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "INVENTORY" || requestType == "INVENTORY_EXACT" || requestType == "BUYBACK" || requestType == "BANK" || requestType == "GBANK" ||
             requestType == "SPELLBOOK" || requestType == "BOT_SKILLS" || requestType == "BOT_REPUTATIONS" ||
-            requestType == "BOT_EMBLEMS" || requestType == "OUTFITS" || requestType == "TRAINER")
+            requestType == "BOT_EMBLEMS" || requestType == "OUTFITS" || requestType == "OUTFITS_FRAMED" || requestType == "TRAINER")
         {
             std::string const token = GetSafeErrorToken(fields, 2);
             if (fields.size() != 3)
@@ -17676,6 +17779,11 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 SendBotEmblemPackets(player, replyType, fields[1], fields[2]);
             else if (requestType == "OUTFITS")
                 SendOutfitPackets(player, replyType, fields[1], fields[2]);
+            else if (requestType == "OUTFITS_FRAMED")
+            {
+                if (!SendOutfitFramedPackets(player, replyType, fields[1], fields[2]))
+                    SendProtocolError(player, replyType, normalized, requestType, fields[2], "FRAME_BUILD_FAILED");
+            }
             else
                 SendTrainerPackets(player, replyType, fields[1], fields[2]);
 
