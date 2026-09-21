@@ -261,6 +261,7 @@ char const* const kHunterPetLifecycleCapability = "HUNTER_PET_LIFECYCLE_V1";
 std::unordered_set<std::string> gHunterPetDismissedStrategyRestore;
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
 char const* const kGroupActionCapability = "GROUP_ACTION_V1";
+char const* const kFormationCapability = "FORMATION_V1";
 char const* const kRtscOrderCapability = "RTSC_ORDER_V1";
 char const* const kQuestAcceptAllCapability = "QUEST_ACCEPT_ALL_V1";
 char const* const kQuestTalkCapability = "QUEST_TALK_V1";
@@ -277,6 +278,9 @@ std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
 std::size_t constexpr kGroupOrderMaxRecentTokens = 32;
 std::size_t constexpr kGroupOrderMaxRequesterStates = 512;
 std::size_t constexpr kGroupOrderMaxMatchedBots = 40;
+std::size_t constexpr kFormationQueryRateLimit = 8;
+std::chrono::milliseconds constexpr kFormationQueryRateWindow(2000);
+std::size_t constexpr kFormationQueryMaxRequesterStates = 512;
 uint32 constexpr kMaxItemActionCount = 1000;
 uint32 constexpr kMaxInventoryItemMoveCount = 1000;
 uint32 constexpr kMaxInventoryItemTradeCount = 1000;
@@ -425,6 +429,7 @@ kHunterPetManageCapability,
 kHunterPetLifecycleCapability,
 kFleeOrderCapability,
 kGroupActionCapability,
+kFormationCapability,
 kRtscOrderCapability,
 kQuestAcceptAllCapability,
         kQuestTalkCapability,
@@ -14456,11 +14461,62 @@ bool IsAllowedFormationName(std::string const& formation)
         "line",
         "circle",
         "chaos",
-        "shield"
+        "shield",
+        "far"
     };
 
     return allowed.find(formation) != allowed.end();
 }
+
+// MB_FORMATION_RATE_LIMIT_F4_V1_BEGIN
+using FormationQueryRateClock = std::chrono::steady_clock;
+std::map<uint32, std::deque<FormationQueryRateClock::time_point>> sFormationQueryRateStates;
+
+bool ConsumeFormationQueryRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    FormationQueryRateClock::time_point const now = FormationQueryRateClock::now();
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+
+    auto pruneQueue = [now](std::deque<FormationQueryRateClock::time_point>& requests)
+    {
+        while (!requests.empty() && now - requests.front() >= kFormationQueryRateWindow)
+            requests.pop_front();
+    };
+
+    auto stateIt = sFormationQueryRateStates.find(requesterKey);
+    if (stateIt == sFormationQueryRateStates.end())
+    {
+        if (sFormationQueryRateStates.size() >= kFormationQueryMaxRequesterStates)
+        {
+            for (auto it = sFormationQueryRateStates.begin(); it != sFormationQueryRateStates.end();)
+            {
+                pruneQueue(it->second);
+                if (it->second.empty())
+                    it = sFormationQueryRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sFormationQueryRateStates.size() >= kFormationQueryMaxRequesterStates)
+            return false;
+
+        stateIt = sFormationQueryRateStates.emplace(
+            requesterKey, std::deque<FormationQueryRateClock::time_point>()).first;
+    }
+
+    std::deque<FormationQueryRateClock::time_point>& requests = stateIt->second;
+    pruneQueue(requests);
+    if (requests.size() >= kFormationQueryRateLimit)
+        return false;
+
+    requests.push_back(now);
+    return true;
+}
+// MB_FORMATION_RATE_LIMIT_F4_V1_END
 
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken)
 {
@@ -14540,7 +14596,13 @@ bool ApplyNativeFormation(Player* bot, std::string const& formation)
         return false;
 
     FormationValue* const value = static_cast<FormationValue*>(context->GetValue<Formation*>("formation"));
-    if (!value || !value->Load(formation))
+    if (!value)
+        return false;
+
+    if (value->Save() == formation)
+        return true;
+
+    if (!value->Load(formation))
         return false;
 
     return value->Save() == formation;
@@ -14563,6 +14625,18 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
         token.size() <= 64 &&
         formation.size() <= 16 &&
         IsAllowedFormationName(formation);
+
+    if (validRequest && !ConsumeGroupOrderRateLimit(requester))
+    {
+        SendProtocolError(requester, replyType, "RUN", "FORMATION", token, "RATE_LIMIT");
+        return;
+    }
+
+    if (validRequest && !RegisterGroupOrderToken(requester, token))
+    {
+        SendProtocolError(requester, replyType, "RUN", "FORMATION", token, "REPLAY");
+        return;
+    }
 
     Group* const requesterGroup = validRequest ? requester->GetGroup() : nullptr;
     if (requesterGroup)
@@ -17661,6 +17735,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             if (!IsValidRequestToken(fields[3]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeFormationQueryRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, fields[3], "RATE_LIMIT");
 
             SendFormationPackets(player, replyType, fields[1], fields[2], fields[3]);
             return true;
