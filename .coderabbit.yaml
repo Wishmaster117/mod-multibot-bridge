@@ -1,0 +1,124 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+
+tone_instructions: |
+  Be terse: at most three sentences per finding.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+
+  # Inline findings only; no per-PR boilerplate.
+  high_level_summary: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  review_status: false
+  review_details: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: false
+  collapse_walkthrough: true
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: false
+    drafts: false
+    base_branches:
+      - "main"
+      - "master"
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "skip-review"
+
+  path_filters:
+    - "!conf/MultiBotBridge.conf.dist"
+    - "!data/sql/**"
+    - "!README.md"
+    - "!**/*.png"
+
+  path_instructions:
+    - path: "src/**/*.{cpp,h,hpp}"
+      instructions: |
+        AzerothCore C++ code standards (https://www.azerothcore.org/wiki/cpp-code-standards);
+        flag violations:
+        - C++20. 4-space indent, tabs forbidden. UTF-8, LF, max 120 columns, trailing newline,
+          no trailing whitespace. Formatting is defined by .clang-format.
+        - Allman braces. No braces around single-line statements. `if (x)`, never `if(x)`.
+          `switch` always has a `default` case; use `[[fallthrough]]`.
+        - Naming: methods and public/protected members UpperCamelCase; private members
+          `_lowerCamelCase`; locals and parameters lowerCamelCase. No Hungarian notation.
+        - Float literals always carry the `f` suffix: `1.0f`, `234.3456f`.
+        - Pointer/reference star binds to the type: `Player* player`, never `Player *player`.
+          `const` after the type: `Player const* player`. `static` first: `static float const x = 1.0f;`.
+        - No magic numbers: named `constexpr` or `enum`/`enum class`, never `#define`.
+        - Header guards on every header file.
+        - Logging: `LOG_INFO("module", "msg {}", arg)` (also LOG_WARN/ERROR/DEBUG) with
+          fmt-style `{}`; never printf-style `%u`/`%s`, `sLog->`, or `printf`.
+        - Never store a raw Player*/Creature*/Unit* past the current call or tick; store the
+          ObjectGuid and resolve at use time via ObjectAccessor or Map lookups.
+        - DB access: PreparedStatement, not raw query strings. Multi-statement writes wrap in
+          SQLTransaction.
+        - Namespace is `Acore::`; flag any `Trinity::` left over from ports.
+
+        mod-multibot-bridge specific architecture & security rules:
+        - Network & Packet Security: Treat all incoming addon messages/packets as untrusted.
+          Ensure strict validation of buffers, string lengths, payload limits, and numeric ranges.
+        - Bot Control & Authorization: Every mutation action (inventory, equipment, talents, trades,
+          spells) MUST validate that the requesting player has explicit authorization/ownership over
+          the target bot (same account, same guild, AddClass, or trusted link).
+        - Threading: No synchronous DB queries (`*Database.Query`/`PQuery`) in code reachable from
+          map thread handlers.
+        - Runtime Safety: Always check pointers against `nullptr` (Player, Creature, Item, Map)
+          before dereferencing. Never operate on units across different maps without validation.
+
+  tools:
+    clang:
+      enabled: false
+    fbinfer:
+      enabled: false
+    cppcheck:
+      enabled: true
+    languagetool:
+      enabled: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - "README.md"
+
+chat:
+  auto_reply: true
