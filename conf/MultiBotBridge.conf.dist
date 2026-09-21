@@ -4,3 +4,8 @@
 # 1 = enabled
 # 0 = disabled
 MultiBotBridge.EnableConsoleLogs = 0
+
+# Comma-separated addon message prefixes accepted by the bridge.
+# Replies are sent using the same prefix as the incoming request.
+# MBOT remains the default for backward compatibility.
+MultiBotBridge.AcceptPrefixes = MBOT,PBAM
