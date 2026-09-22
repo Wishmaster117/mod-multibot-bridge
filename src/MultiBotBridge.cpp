@@ -12568,6 +12568,24 @@ void SendStrategyMutationAck(
     SendStateAddonPacket(requester, replyType, "STRATEGY_ACK", fallbackPayload.str());
 }
 
+enum class DeferredOrdinaryWarlockStoneStartResult
+{
+    NotApplicable,
+    Started,
+    Failed
+};
+
+DeferredOrdinaryWarlockStoneStartResult TryBeginDeferredOrdinaryWarlockStoneSwitch(
+    Player* requester,
+    Player* bot,
+    ChatMsg replyType,
+    std::string const& target,
+    std::string const& token,
+    std::string const& stateScope,
+    std::string const& normalizedChanges,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& failureReason);
+
 void RunStrategyMutationCommand(
     Player* requester,
     ChatMsg replyType,
@@ -12625,6 +12643,42 @@ void RunStrategyMutationCommand(
         }
 
         ++matched;
+
+        if (scope == "BOT" && stateScope == "N")
+        {
+            std::string deferredFailureReason;
+            DeferredOrdinaryWarlockStoneStartResult const deferredResult =
+                TryBeginDeferredOrdinaryWarlockStoneSwitch(
+                    requester,
+                    bot,
+                    replyType,
+                    target,
+                    token,
+                    stateScope,
+                    normalizedChanges,
+                    operations,
+                    deferredFailureReason);
+
+            if (deferredResult == DeferredOrdinaryWarlockStoneStartResult::Started)
+                return;
+
+            if (deferredResult == DeferredOrdinaryWarlockStoneStartResult::Failed)
+            {
+                SendStrategyMutationAck(
+                    requester,
+                    replyType,
+                    scope,
+                    target,
+                    token,
+                    stateScope,
+                    1,
+                    0,
+                    1,
+                    deferredFailureReason.empty() ? "STONE_FAILED" : deferredFailureReason);
+                return;
+            }
+        }
+
         if (ApplyNativeStrategyMutation(requester, bot, actionName, botState, normalizedChanges, operations))
             ++succeeded;
         else
@@ -13112,6 +13166,485 @@ DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
     return DeferredWarlockStoneStartResult::Started;
 }
 
+
+struct PendingOrdinaryWarlockStoneSwitch
+{
+    ObjectGuid requesterGuid;
+    ObjectGuid botGuid;
+    uint32 requesterMapId = 0;
+    uint32 botMapId = 0;
+    std::string target;
+    std::string token;
+    std::string stateScope;
+    ChatMsg replyType = CHAT_MSG_WHISPER;
+    std::string desiredStone;
+    std::map<std::string, bool> priorStrategyStates;
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::size_t applyAttempts = 0;
+    bool completionScheduled = false;
+};
+
+std::map<ObjectGuid, PendingOrdinaryWarlockStoneSwitch> sPendingOrdinaryWarlockStoneSwitches;
+
+Player* FindPendingOrdinaryWarlockStoneBot(Player* requester, PendingOrdinaryWarlockStoneSwitch const& pending)
+{
+    if (!requester)
+        return nullptr;
+
+    for (Player* const visibleBot : GetBridgeVisibleBots(requester))
+    {
+        if (visibleBot && visibleBot->GetGUID() == pending.botGuid)
+            return visibleBot;
+    }
+
+    return nullptr;
+}
+
+bool RollbackPendingOrdinaryWarlockStoneStrategies(
+    Player* requester,
+    Player* bot,
+    PendingOrdinaryWarlockStoneSwitch const& pending)
+{
+    if (!bot)
+        return false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return false;
+
+    Player* const eventOwner = requester ? requester : bot;
+    return RollbackNativeStrategyMutation(
+        eventOwner,
+        botAI,
+        "nc",
+        BOT_STATE_NON_COMBAT,
+        pending.priorStrategyStates);
+}
+
+void FinishPendingOrdinaryWarlockStoneSwitch(
+    Player* bot,
+    ObjectGuid const& botGuid,
+    std::string const& token,
+    bool success,
+    std::string const& reason)
+{
+    auto const pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+    if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingOrdinaryWarlockStoneSwitch const pending = pendingIt->second;
+    Player* const requester = ObjectAccessor::FindConnectedPlayer(pending.requesterGuid);
+
+    if (!bot)
+        bot = ObjectAccessor::FindPlayer(pending.botGuid);
+
+    if (!success)
+    {
+        bool const rollbackSucceeded = RollbackPendingOrdinaryWarlockStoneStrategies(requester, bot, pending);
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone strategy rollback requester={} bot={} requested={} reason={} succeeded={}",
+                requester ? requester->GetName() : "<offline>",
+                bot ? bot->GetName() : pending.target,
+                pending.desiredStone,
+                reason,
+                rollbackSucceeded);
+        }
+    }
+
+    sPendingOrdinaryWarlockStoneSwitches.erase(pendingIt);
+
+    if (requester && requester->GetSession())
+    {
+        SendStrategyMutationAck(
+            requester,
+            pending.replyType,
+            "BOT",
+            pending.target,
+            pending.token,
+            pending.stateScope,
+            1,
+            success ? 1 : 0,
+            success ? 0 : 1,
+            success ? "APPLIED" : reason);
+    }
+}
+
+void SchedulePendingOrdinaryWarlockStoneCompletion(
+    Player* bot,
+    ObjectGuid const& botGuid,
+    std::string const& token);
+
+void CompletePendingOrdinaryWarlockStoneSwitch(
+    Player* bot,
+    ObjectGuid const& botGuid,
+    std::string const& token)
+{
+    auto pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+    if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    PendingOrdinaryWarlockStoneSwitch& pending = pendingIt->second;
+    ++pending.applyAttempts;
+
+    Player* const requester = ObjectAccessor::FindConnectedPlayer(pending.requesterGuid);
+    if (!requester || !requester->GetSession())
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_REQUESTER_OFFLINE");
+        return;
+    }
+
+    if (!bot || bot->GetGUID() != pending.botGuid || !bot->IsInWorld() || bot->getClass() != CLASS_WARLOCK)
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_STATE_INVALID");
+        return;
+    }
+
+    if (requester->GetMapId() != pending.requesterMapId || bot->GetMapId() != pending.botMapId)
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_MAP_CHANGED");
+        return;
+    }
+
+    Player* const visibleBot = FindPendingOrdinaryWarlockStoneBot(requester, pending);
+    if (!visibleBot || visibleBot != bot)
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_BOT_NOT_VISIBLE");
+        return;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_NO_AI");
+        return;
+    }
+
+    if (bot->IsInCombat())
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_COMBAT");
+        return;
+    }
+
+    if (bot->IsNonMeleeSpellCast(false) || !HasNamedWarlockStoneItem(botAI, pending.desiredStone))
+    {
+        if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+        {
+            SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
+            return;
+        }
+
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_ITEM_NOT_READY");
+        return;
+    }
+
+    WarlockStoneSwitchResult const result = TryForceWarlockStoneSwitch(
+        requester,
+        bot,
+        botAI,
+        BOT_STATE_NON_COMBAT,
+        pending.hadFirestoneStrategy,
+        pending.hadSpellstoneStrategy);
+
+    if (result == WarlockStoneSwitchResult::Applied)
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone switch applied requester={} bot={} requested={} attempts={}",
+                requester->GetName(),
+                bot->GetName(),
+                pending.desiredStone,
+                pending.applyAttempts);
+        }
+
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, true, "APPLIED");
+        return;
+    }
+
+    FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_APPLY_FAILED");
+}
+
+void SchedulePendingOrdinaryWarlockStoneCompletion(
+    Player* bot,
+    ObjectGuid const& botGuid,
+    std::string const& token)
+{
+    if (!bot)
+        return;
+
+    bot->m_Events.AddEventAtOffset(
+        [bot, botGuid, token]()
+        {
+            CompletePendingOrdinaryWarlockStoneSwitch(bot, botGuid, token);
+        },
+        kWarlockStoneSwitchApplyRetryDelay);
+}
+
+void TimeoutPendingOrdinaryWarlockStoneSwitch(
+    Player* bot,
+    ObjectGuid const& botGuid,
+    std::string const& token)
+{
+    auto const pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+    if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred ordinary warlock stone switch timeout bot={} requested={}",
+            bot ? bot->GetName() : pendingIt->second.target,
+            pendingIt->second.desiredStone);
+    }
+
+    FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_CREATE_TIMEOUT");
+}
+
+void NotifyPendingOrdinaryWarlockStoneItemCreated(Player* player, Item* item)
+{
+    if (!player || !item || !IsTemporaryWeaponEnchantItem(item))
+        return;
+
+    ObjectGuid const botGuid = player->GetGUID();
+    auto pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+    if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.completionScheduled)
+        return;
+
+    pendingIt->second.completionScheduled = true;
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred ordinary warlock stone item created bot={} requested={} itemEntry={}",
+            player->GetName(),
+            pendingIt->second.desiredStone,
+            item->GetEntry());
+    }
+
+    SchedulePendingOrdinaryWarlockStoneCompletion(player, botGuid, pendingIt->second.token);
+}
+
+void CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(
+    Player* player,
+    std::string const& reason,
+    bool sendAckToChangingRequester)
+{
+    if (!player)
+        return;
+
+    ObjectGuid const playerGuid = player->GetGUID();
+    std::vector<ObjectGuid> affectedBotGuids;
+
+    for (auto const& entry : sPendingOrdinaryWarlockStoneSwitches)
+    {
+        PendingOrdinaryWarlockStoneSwitch const& pending = entry.second;
+        if (pending.botGuid == playerGuid || pending.requesterGuid == playerGuid)
+            affectedBotGuids.push_back(entry.first);
+    }
+
+    for (ObjectGuid const& botGuid : affectedBotGuids)
+    {
+        auto const pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+        if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end())
+            continue;
+
+        PendingOrdinaryWarlockStoneSwitch const pending = pendingIt->second;
+        Player* const requester =
+            pending.requesterGuid == playerGuid ? player : ObjectAccessor::FindConnectedPlayer(pending.requesterGuid);
+        Player* const bot =
+            pending.botGuid == playerGuid ? player : ObjectAccessor::FindPlayer(pending.botGuid);
+
+        bool const rollbackSucceeded = RollbackPendingOrdinaryWarlockStoneStrategies(requester, bot, pending);
+        sPendingOrdinaryWarlockStoneSwitches.erase(pendingIt);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone switch cancelled requester={} bot={} requested={} reason={} rollback={}",
+                requester ? requester->GetName() : "<offline>",
+                bot ? bot->GetName() : pending.target,
+                pending.desiredStone,
+                reason,
+                rollbackSucceeded);
+        }
+
+        bool const requesterIsChangingPlayer = pending.requesterGuid == playerGuid;
+        bool const shouldSendAck = requester && requester->GetSession() &&
+            (!requesterIsChangingPlayer || sendAckToChangingRequester);
+
+        if (shouldSendAck)
+        {
+            SendStrategyMutationAck(
+                requester,
+                pending.replyType,
+                "BOT",
+                pending.target,
+                pending.token,
+                pending.stateScope,
+                1,
+                0,
+                1,
+                reason);
+        }
+    }
+}
+
+DeferredOrdinaryWarlockStoneStartResult TryBeginDeferredOrdinaryWarlockStoneSwitch(
+    Player* requester,
+    Player* bot,
+    ChatMsg replyType,
+    std::string const& target,
+    std::string const& token,
+    std::string const& stateScope,
+    std::string const& normalizedChanges,
+    std::vector<StrategyMutationOperation> const& operations,
+    std::string& failureReason)
+{
+    if (!requester || !bot || stateScope != "N" || bot->getClass() != CLASS_WARLOCK)
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        failureReason = "STONE_NO_AI";
+        return DeferredOrdinaryWarlockStoneStartResult::Failed;
+    }
+
+    ObjectGuid const botGuid = bot->GetGUID();
+    auto const existingPendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+    if (existingPendingIt != sPendingOrdinaryWarlockStoneSwitches.end())
+    {
+        PendingOrdinaryWarlockStoneSwitch const& pending = existingPendingIt->second;
+        for (StrategyMutationOperation const& operation : operations)
+        {
+            if (pending.priorStrategyStates.find(operation.name) != pending.priorStrategyStates.end())
+            {
+                failureReason = "STONE_SWITCH_PENDING";
+                return DeferredOrdinaryWarlockStoneStartResult::Failed;
+            }
+        }
+    }
+
+    bool hadFirestoneStrategy = false;
+    bool hadSpellstoneStrategy = false;
+    std::string desiredStone;
+    if (!TryGetRequestedWarlockStoneSwitch(
+        botAI,
+        operations,
+        hadFirestoneStrategy,
+        hadSpellstoneStrategy,
+        desiredStone))
+    {
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+    }
+
+    Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (!currentEnchantId)
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+
+    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(bot);
+    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+
+    if (HasNamedWarlockStoneItem(botAI, desiredStone))
+        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+
+    if (bot->IsInCombat())
+    {
+        failureReason = "STONE_COMBAT";
+        return DeferredOrdinaryWarlockStoneStartResult::Failed;
+    }
+
+    if (sPendingOrdinaryWarlockStoneSwitches.size() >= kWarlockStoneSwitchMaxPending)
+    {
+        failureReason = "STONE_PENDING_LIMIT";
+        return DeferredOrdinaryWarlockStoneStartResult::Failed;
+    }
+
+    std::map<std::string, bool> const priorStrategyStates =
+        CaptureStrategyMutationState(botAI, BOT_STATE_NON_COMBAT, operations);
+
+    if (!botAI->DoSpecificAction("nc", Event("nc", normalizedChanges, requester), true) ||
+        !VerifyStrategyMutationResult(botAI, BOT_STATE_NON_COMBAT, operations))
+    {
+        failureReason = "STONE_STRATEGY_FAILED";
+        return DeferredOrdinaryWarlockStoneStartResult::Failed;
+    }
+
+    PendingOrdinaryWarlockStoneSwitch pending;
+    pending.requesterGuid = requester->GetGUID();
+    pending.botGuid = botGuid;
+    pending.requesterMapId = requester->GetMapId();
+    pending.botMapId = bot->GetMapId();
+    pending.target = target;
+    pending.token = token;
+    pending.stateScope = stateScope;
+    pending.replyType = replyType;
+    pending.desiredStone = desiredStone;
+    pending.priorStrategyStates = priorStrategyStates;
+    pending.hadFirestoneStrategy = hadFirestoneStrategy;
+    pending.hadSpellstoneStrategy = hadSpellstoneStrategy;
+
+    sPendingOrdinaryWarlockStoneSwitches.emplace(botGuid, pending);
+
+    bot->m_Events.AddEventAtOffset(
+        [bot, botGuid, token]()
+        {
+            TimeoutPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token);
+        },
+        kWarlockStoneSwitchCreateTimeout);
+
+    std::string const createAction = "create " + desiredStone;
+    if (!botAI->DoSpecificAction(createAction, Event(), true))
+    {
+        auto const failedPendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+        PendingOrdinaryWarlockStoneSwitch const failedPending = failedPendingIt->second;
+        sPendingOrdinaryWarlockStoneSwitches.erase(failedPendingIt);
+        bool const rollbackSucceeded =
+            RollbackPendingOrdinaryWarlockStoneStrategies(requester, bot, failedPending);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone create failed requester={} bot={} requested={} rollback={}",
+                requester->GetName(),
+                bot->GetName(),
+                desiredStone,
+                rollbackSucceeded);
+        }
+
+        failureReason = "STONE_CREATE_FAILED";
+        return DeferredOrdinaryWarlockStoneStartResult::Failed;
+    }
+
+    if (BridgeConsoleLogsEnabled())
+    {
+        LOG_INFO(
+            "playerbots",
+            "MultiBotBridge deferred ordinary warlock stone create started requester={} bot={} requested={} token={}",
+            requester->GetName(),
+            bot->GetName(),
+            desiredStone,
+            token);
+    }
+
+    return DeferredOrdinaryWarlockStoneStartResult::Started;
+}
 
 bool IsAllowedSelfCombatStrategyForClass(Player* requester, std::string const& name)
 {
@@ -19478,16 +20011,19 @@ public:
     void OnPlayerCreateItem(Player* player, Item* item, uint32 /*count*/) override
     {
         NotifyPendingWarlockStoneItemCreated(player, item);
+        NotifyPendingOrdinaryWarlockStoneItemCreated(player, item);
     }
 
     void OnPlayerBeforeLogout(Player* player) override
     {
         CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
+        CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_LOGOUT", false);
     }
 
     void OnPlayerMapChanged(Player* player) override
     {
         CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
+        CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_MAP_CHANGED", true);
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* /*receiver*/) override
