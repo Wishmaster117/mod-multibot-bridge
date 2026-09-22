@@ -208,6 +208,11 @@ std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
+std::size_t constexpr kCraftRecipeRateLimit = 4;
+std::chrono::milliseconds constexpr kCraftRecipeRateWindow(2000);
+std::chrono::seconds constexpr kCraftRecipeReplayTtl(10);
+std::size_t constexpr kCraftRecipeMaxRecentTokens = 32;
+std::size_t constexpr kCraftRecipeMaxRequesterStates = 512;
 std::size_t constexpr kCraftRecipeTargetRateLimit = 4;
 std::chrono::milliseconds constexpr kCraftRecipeTargetRateWindow(2000);
 std::chrono::seconds constexpr kCraftRecipeTargetReplayTtl(10);
@@ -2339,6 +2344,85 @@ bool IsAllowedProfessionRecipeTargetPosition(uint32 bag, uint32 slot)
     }
 
     return bag >= INVENTORY_SLOT_BAG_START && bag < INVENTORY_SLOT_BAG_END;
+}
+
+struct CraftRecipeRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, CraftRecipeRateState> sCraftRecipeRateStates;
+
+void PruneCraftRecipeRateState(CraftRecipeRateState& state, std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kCraftRecipeRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kCraftRecipeReplayTtl)
+        state.recentTokens.pop_front();
+    while (state.recentTokens.size() > kCraftRecipeMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+bool ConsumeCraftRecipeRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    auto stateIt = sCraftRecipeRateStates.find(key);
+
+    if (stateIt == sCraftRecipeRateStates.end())
+    {
+        if (sCraftRecipeRateStates.size() >= kCraftRecipeMaxRequesterStates)
+        {
+            for (auto it = sCraftRecipeRateStates.begin(); it != sCraftRecipeRateStates.end();)
+            {
+                PruneCraftRecipeRateState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sCraftRecipeRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sCraftRecipeRateStates.size() >= kCraftRecipeMaxRequesterStates)
+            return false;
+
+        stateIt = sCraftRecipeRateStates.emplace(key, CraftRecipeRateState()).first;
+    }
+
+    CraftRecipeRateState& state = stateIt->second;
+    PruneCraftRecipeRateState(state, now);
+    if (state.requests.size() >= kCraftRecipeRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterCraftRecipeToken(Player* requester, std::string const& token)
+{
+    if (!requester || !IsValidRequestToken(token))
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    auto stateIt = sCraftRecipeRateStates.find(requester->GetName());
+    if (stateIt == sCraftRecipeRateStates.end())
+        return false;
+
+    CraftRecipeRateState& state = stateIt->second;
+    PruneCraftRecipeRateState(state, now);
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.push_back({token, now});
+    while (state.recentTokens.size() > kCraftRecipeMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
 }
 
 struct CraftRecipeTargetRateState
@@ -8819,6 +8903,9 @@ void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string co
 
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
 {
+    if (!requester || !requester->GetSession())
+        return;
+
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
     uint32 skillId = 0;
@@ -8832,7 +8919,14 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     uint32 actualItemId = expectedItemId;
-    std::string result = ValidateProfessionRecipeCraft(bot, skillId, spellId, expectedItemId, actualItemId);
+    std::string result = "OK";
+    if (!ConsumeCraftRecipeRateLimit(requester))
+        result = "RATE_LIMIT";
+    else if (!RegisterCraftRecipeToken(requester, token))
+        result = "REPLAY";
+    else
+        result = ValidateProfessionRecipeCraft(bot, skillId, spellId, expectedItemId, actualItemId);
+
     if (result == "OK")
     {
         SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
