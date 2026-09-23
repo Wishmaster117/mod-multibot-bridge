@@ -68,6 +68,7 @@ The module does **not** expose an arbitrary Playerbots command executor.
 | **Target resolution** | Resolve an authorized bot name to the canonical lifecycle target used by social rosters. |
 | **Bot state** | Framed strategy/state reads used by the addon UI. |
 | **Strategy mutations** | Structured strategy changes for migrated controls. |
+| **Warlock stones** | `WARLOCK_STONE_STATE_V1` exposes authoritative Firestone/Spellstone physical state, bounded create/apply handling, known-enchant-only physical OFF and specialized silent item application without modifying Playerbots. |
 | **Inventory** | Standard and exact physical inventory snapshots. |
 | **Item actions** | Move, equip, unequip, use, destroy, Trade, vendor sale and related structured results. |
 | **Bank / Guild Bank** | Structured views/actions including exact physical deposits. |
@@ -363,6 +364,22 @@ Runtime validation on **19 September 2026** covered cast, ignore/allow, localize
 
 ---
 
+# Warlock Firestone / Spellstone
+
+Warlock stone state and application are exposed through the specialized capability:
+
+```text
+WARLOCK_STONE_STATE_V1
+```
+
+The Bridge reports the authoritative physical main-hand state as `NONE`, `FIRESTONE`, `SPELLSTONE` or `OTHER`. Canonical Warlock stone enchants are derived from the audited item templates, and physical OFF clears only a recognized Firestone/Spellstone temporary enchant. An unrelated `TEMP_ENCHANTMENT_SLOT` value is preserved.
+
+When a requested stone is missing, the existing bounded create phase is retained. The apply phase then submits the validated `CMSG_USE_ITEM` packet directly for this specialized path instead of calling Playerbots' generic `UseSpellItemAction`, avoiding its automatic `TellMaster` `Using [...]` feedback. The existing authoritative lifecycle still waits until the expected physical enchant is observed before the final structured ACK.
+
+Runtime validation on **23 September 2026** covered Firestone → Spellstone, Spellstone → Firestone, both physical OFF paths and missing-stone create/apply. The client displays a concise system confirmation after successful completion, and `mod-playerbots` remains strictly read-only.
+
+---
+
 # Security Model
 
 All addon input is treated as untrusted.
@@ -396,6 +413,7 @@ The Bridge currently advertises a growing set of dedicated capabilities, includi
 ```text
 STATE_FRAMING_V1
 STRATEGY_MUTATION_V1
+WARLOCK_STONE_STATE_V1
 OUTFIT_V1
 INVENTORY_V1
 INVENTORY_EXACT_V1
@@ -415,6 +433,7 @@ QUEST_ABANDON_V1
 TALENT_APPLY_V1
 TALENT_SPEC_APPLY_V1
 CRAFT_RECIPE_TARGET_V1
+FORMATION_V1
 GROUP_ROLL_V1
 ENCHANT_TRADE_V1
 SELF_BOT_V1
@@ -425,6 +444,7 @@ BOT_LIFECYCLE_V1
 BOT_TARGET_RESOLVE_V1
 BOT_GROUP_REMOVE_V1
 BOT_GROUP_LIFECYCLE_V1
+BOT_MAINTENANCE_V1
 CREATOR_ADDCLASS_V1
 CREATOR_INIT_AUTO_V1
 FOLLOW_ORDER_V1
@@ -461,10 +481,10 @@ The exact packet schemas are implementation details shared with the addon and ma
 
 `mod-multibot-bridge` must be configured and compiled against the **current `master` revision of the official [`mod-playerbots`](https://github.com/mod-playerbots/mod-playerbots) repository**. Do not assume compatibility with an older checkout, an archived revision or an unrelated fork. Synchronize `modules/mod-playerbots` with the official repository before configuring/rebuilding the Bridge.
 
-Validated upstream revision on **18 September 2026**:
+Validated upstream revision on **23 September 2026**:
 
 ```text
-b6696bdbd3740e575598d167d69f39f68cc0b907
+7bae1b5c58c76a0aa20381155edc08096d1485b2
 ```
 
 This SHA records the revision used for the current validation; the compatibility rule remains to use the current official `master` revision when building the Bridge.
@@ -506,7 +526,7 @@ The historical group bulk pair `.playerbot bot add *` / `.playerbot bot remove *
 
 Creator `addclass` is migrated through the specialized `CREATOR_ADDCLASS_V1` endpoint and runtime validated without a generic command proxy. Creator `init=auto` is also migrated through the bounded `CREATOR_INIT_AUTO_V1` target/group adapter. Obsolete Units/lifecycle legacy cleanup stays deferred to the final global fallback/parser cleanup.
 
-The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are present, `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow, Hunter Pet H1/H2/H3 is runtime validated through `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1`, and Spellbook Cast / Ignore is runtime validated through `SPELLBOOK_CAST_V1` and `SPELLBOOK_IGNORE_V1`. The remaining active work is the explicitly deferred technical residuals followed by final legacy parser/fallback cleanup.
+The bounded Group Actions set `drink`, `release`, `revive` and `summon` is migrated through `GROUP_ACTION_V1`. RTSC is migrated and runtime validated through `RTSC_ORDER_V1`, while AEDM intentionally remains on the native WoW/Playerbots spell path. The five structured Quest interaction capabilities are present, `AUTOGEAR_OPTIONS_V1` provides the validated server-authoritative INFO/PLAN/APPLY workflow, Maintenance M1/M2 is completed through `BOT_MAINTENANCE_V1`, Hunter Pet H1/H2/H3 is runtime validated through `HUNTER_PET_CONTROL_V1`, `HUNTER_PET_MANAGE_V1` and `HUNTER_PET_LIFECYCLE_V1`, and Spellbook Cast / Ignore is runtime validated through `SPELLBOOK_CAST_V1` and `SPELLBOOK_IGNORE_V1`. Trainer lifecycle, Outfit lifecycle, Rogue strategy-name compatibility, Formation F1–F6 and normal Craft C1 hardening are closed. Warlock Firestone/Spellstone is finalized through `WARLOCK_STONE_STATE_V1`, including authoritative physical state, specialized silent item application and known-enchant-only OFF. The remaining active work is the explicitly deferred technical residuals followed by final global legacy parser/fallback and chat-path cleanup.
 
 The project remains intentionally **bridge-first / mostly chatless** while the remaining chat families are audited and migrated independently.
 

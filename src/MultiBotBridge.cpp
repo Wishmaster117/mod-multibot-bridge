@@ -205,6 +205,7 @@ std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
 std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
 std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
+std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyTimeout(3500);
 std::size_t constexpr kEnchantTradeRateLimit = 4;
 std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
 std::size_t constexpr kMaxEnchantTradeEntries = 256;
@@ -277,6 +278,7 @@ char const* const kAutogearOptionsCapability = "AUTOGEAR_OPTIONS_V1";
 char const* const kBotMaintenanceCapability = "BOT_MAINTENANCE_V1";
 char const* const kSpellbookCastCapability = "SPELLBOOK_CAST_V1";
 char const* const kSpellbookIgnoreCapability = "SPELLBOOK_IGNORE_V1";
+char const* const kWarlockStoneStateCapability = "WARLOCK_STONE_STATE_V1";
 std::size_t constexpr kGroupOrderRateLimit = 8;
 std::chrono::milliseconds constexpr kGroupOrderRateWindow(2000);
 std::chrono::seconds constexpr kGroupOrderReplayTtl(10);
@@ -444,7 +446,8 @@ kQuestAcceptAllCapability,
         kAutogearOptionsCapability,
         kBotMaintenanceCapability,
         kSpellbookCastCapability,
-        kSpellbookIgnoreCapability
+        kSpellbookIgnoreCapability,
+        kWarlockStoneStateCapability
     };
 
     std::vector<std::string> chunks;
@@ -12234,14 +12237,51 @@ void CollectCarriedWarlockStoneEnchantIds(Item* item, std::set<uint32>& enchantI
     }
 }
 
-std::set<uint32> GetCarriedWarlockStoneEnchantIds(Player* bot)
+
+void CollectCarriedWarlockStoneEnchantIdsForKind(
+    Item* item,
+    std::string const& stoneName,
+    std::set<uint32>& enchantIds)
+{
+    if (!item || stoneName.empty())
+        return;
+
+    ItemTemplate const* const proto = item->GetTemplate();
+    if (!proto)
+        return;
+
+    std::string const itemName = ToLower(proto->Name1);
+    if (itemName.find(stoneName) == std::string::npos)
+        return;
+
+    for (uint8 spellIndex = 0; spellIndex < MAX_ITEM_PROTO_SPELLS; ++spellIndex)
+    {
+        uint32 const spellId = proto->Spells[spellIndex].SpellId;
+        if (!spellId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            continue;
+
+        for (uint8 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        {
+            SpellEffectInfo const& effect = spellInfo->Effects[effectIndex];
+            if (effect.Effect == SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY && effect.MiscValue > 0)
+                enchantIds.insert(static_cast<uint32>(effect.MiscValue));
+        }
+    }
+}
+
+std::set<uint32> GetCarriedWarlockStoneEnchantIdsForKind(Player* bot, std::string const& stoneName)
 {
     std::set<uint32> enchantIds;
-    if (!bot)
+    if (!bot || stoneName.empty())
         return enchantIds;
 
     for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-        CollectCarriedWarlockStoneEnchantIds(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), enchantIds);
+        CollectCarriedWarlockStoneEnchantIdsForKind(
+            bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), stoneName, enchantIds);
 
     for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
     {
@@ -12250,10 +12290,96 @@ std::set<uint32> GetCarriedWarlockStoneEnchantIds(Player* bot)
             continue;
 
         for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
-            CollectCarriedWarlockStoneEnchantIds(pBag->GetItemByPos(slot), enchantIds);
+            CollectCarriedWarlockStoneEnchantIdsForKind(pBag->GetItemByPos(slot), stoneName, enchantIds);
     }
 
     return enchantIds;
+}
+
+struct WarlockStoneEnchantCatalog
+{
+    std::set<uint32> firestoneEnchantIds;
+    std::set<uint32> spellstoneEnchantIds;
+};
+
+void CollectWarlockStoneEnchantIdsFromTemplate(
+    ItemTemplate const& proto,
+    std::set<uint32>& enchantIds)
+{
+    for (uint8 spellIndex = 0; spellIndex < MAX_ITEM_PROTO_SPELLS; ++spellIndex)
+    {
+        uint32 const spellId = proto.Spells[spellIndex].SpellId;
+        if (!spellId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            continue;
+
+        for (uint8 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        {
+            SpellEffectInfo const& effect = spellInfo->Effects[effectIndex];
+            if (effect.Effect == SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY && effect.MiscValue > 0)
+                enchantIds.insert(static_cast<uint32>(effect.MiscValue));
+        }
+    }
+}
+
+WarlockStoneEnchantCatalog BuildWarlockStoneEnchantCatalog()
+{
+    WarlockStoneEnchantCatalog catalog;
+
+    ItemTemplateContainer const* const itemTemplates = sObjectMgr->GetItemTemplateStore();
+    if (!itemTemplates)
+        return catalog;
+
+    for (ItemTemplateContainer::value_type const& itemTemplatePair : *itemTemplates)
+    {
+        ItemTemplate const& proto = itemTemplatePair.second;
+        std::string const itemName = ToLower(proto.Name1);
+
+        bool const isFirestone = itemName.find("firestone") != std::string::npos;
+        bool const isSpellstone = itemName.find("spellstone") != std::string::npos;
+        if (isFirestone == isSpellstone)
+            continue;
+
+        CollectWarlockStoneEnchantIdsFromTemplate(
+            proto,
+            isFirestone ? catalog.firestoneEnchantIds : catalog.spellstoneEnchantIds);
+    }
+
+    return catalog;
+}
+
+WarlockStoneEnchantCatalog const& GetWarlockStoneEnchantCatalog()
+{
+    static WarlockStoneEnchantCatalog const catalog = BuildWarlockStoneEnchantCatalog();
+    return catalog;
+}
+
+bool IsKnownWarlockStoneEnchant(uint32 enchantId)
+{
+    if (!enchantId)
+        return false;
+
+    WarlockStoneEnchantCatalog const& catalog = GetWarlockStoneEnchantCatalog();
+    return catalog.firestoneEnchantIds.find(enchantId) != catalog.firestoneEnchantIds.end() ||
+        catalog.spellstoneEnchantIds.find(enchantId) != catalog.spellstoneEnchantIds.end();
+}
+
+std::string ClassifyWarlockStoneEnchant(uint32 enchantId)
+{
+    if (!enchantId)
+        return "NONE";
+
+    WarlockStoneEnchantCatalog const& catalog = GetWarlockStoneEnchantCatalog();
+    bool const isFirestone = catalog.firestoneEnchantIds.find(enchantId) != catalog.firestoneEnchantIds.end();
+    bool const isSpellstone = catalog.spellstoneEnchantIds.find(enchantId) != catalog.spellstoneEnchantIds.end();
+
+    if (isFirestone != isSpellstone)
+        return isFirestone ? "FIRESTONE" : "SPELLSTONE";
+
+    return "OTHER";
 }
 
 enum class WarlockStoneSwitchResult
@@ -12331,6 +12457,113 @@ bool RollbackNativeStrategyMutation(
     return VerifyStrategyMutationResult(botAI, botState, rollbackOperations);
 }
 
+// MB_WARLOCK_STONE_FINAL_V1_BEGIN
+bool ResolveWarlockStoneDestination(
+    bool hadFirestoneStrategy,
+    bool hadSpellstoneStrategy,
+    bool hasFirestoneStrategy,
+    bool hasSpellstoneStrategy,
+    std::string& desiredStone)
+{
+    desiredStone.clear();
+
+    if (hasFirestoneStrategy && !hasSpellstoneStrategy &&
+        (!hadFirestoneStrategy || hadSpellstoneStrategy))
+    {
+        desiredStone = "firestone";
+    }
+    else if (!hasFirestoneStrategy && hasSpellstoneStrategy &&
+        (hadFirestoneStrategy || !hadSpellstoneStrategy))
+    {
+        desiredStone = "spellstone";
+    }
+    else if (!hasFirestoneStrategy && !hasSpellstoneStrategy &&
+        (hadFirestoneStrategy || hadSpellstoneStrategy))
+    {
+        desiredStone = "none";
+    }
+
+    return !desiredStone.empty();
+}
+
+bool UseWarlockStoneItemSilently(
+    Player* bot,
+    PlayerbotAI* botAI,
+    std::string const& stoneName,
+    Item* expectedTarget)
+{
+    if (!bot || !bot->GetSession() || !botAI || !botAI->GetAiObjectContext() || !expectedTarget ||
+        (stoneName != "firestone" && stoneName != "spellstone"))
+    {
+        return false;
+    }
+
+    std::vector<Item*> const items =
+        botAI->GetAiObjectContext()->GetValue<std::vector<Item*>>("inventory items", stoneName)->Get();
+    if (items.empty())
+        return false;
+
+    Item* const stoneItem = *items.begin();
+    ItemTemplate const* const stoneTemplate = stoneItem ? stoneItem->GetTemplate() : nullptr;
+    if (!stoneItem || !stoneTemplate || bot->CanUseItem(stoneItem) != EQUIP_ERR_OK ||
+        bot->IsNonMeleeSpellCast(false))
+    {
+        return false;
+    }
+
+    uint32 spellId = 0;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+    {
+        if (stoneTemplate->Spells[i].SpellId <= 0)
+            continue;
+
+        spellId = stoneTemplate->Spells[i].SpellId;
+        if (!botAI->CanCastSpell(spellId, bot, false, nullptr, stoneItem))
+            return false;
+    }
+
+    if (!spellId)
+        return false;
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || !(spellInfo->Targets & TARGET_FLAG_ITEM))
+        return false;
+
+    Item* const itemForSpell =
+        botAI->GetAiObjectContext()->GetValue<Item*>("item for spell", spellId)->Get();
+    if (!itemForSpell || itemForSpell != expectedTarget ||
+        itemForSpell->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT))
+    {
+        return false;
+    }
+
+    bot->ClearUnitState(UNIT_STATE_CHASE);
+    bot->ClearUnitState(UNIT_STATE_FOLLOW);
+
+    if (bot->isMoving())
+    {
+        bot->StopMoving();
+        botAI->SetNextCheckDelay(sPlayerbotAIConfig.globalCoolDown);
+        return false;
+    }
+
+    uint8 const bagIndex = stoneItem->GetBagSlot();
+    uint8 const slot = stoneItem->GetSlot();
+    ObjectGuid const itemGuid = stoneItem->GetGUID();
+    uint32 const targetFlag = TARGET_FLAG_ITEM;
+
+    WorldPacket packet(CMSG_USE_ITEM);
+    packet << bagIndex << slot << uint8(1) << spellId << itemGuid << uint32(0) << uint8(0);
+    packet << targetFlag;
+    packet << itemForSpell->GetGUID().WriteAsPacked();
+
+    uint32 const castTime = spellInfo->CalcCastTime();
+    botAI->SetNextCheckDelay(castTime + sPlayerbotAIConfig.reactDelay);
+    bot->GetSession()->HandleUseItemOpcode(packet);
+    return true;
+}
+// MB_WARLOCK_STONE_FINAL_V1_END
+
 WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
     Player* requester,
     Player* bot,
@@ -12346,23 +12579,64 @@ WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
     bool const hasSpellstoneStrategy = botAI->HasStrategy("spellstone", BOT_STATE_NON_COMBAT);
 
     std::string desiredStone;
-    if (!hadFirestoneStrategy && hadSpellstoneStrategy && hasFirestoneStrategy && !hasSpellstoneStrategy)
-        desiredStone = "firestone";
-    else if (hadFirestoneStrategy && !hadSpellstoneStrategy && !hasFirestoneStrategy && hasSpellstoneStrategy)
-        desiredStone = "spellstone";
-    else
+    if (!ResolveWarlockStoneDestination(
+            hadFirestoneStrategy,
+            hadSpellstoneStrategy,
+            hasFirestoneStrategy,
+            hasSpellstoneStrategy,
+            desiredStone))
+    {
         return WarlockStoneSwitchResult::NotRequired;
+    }
 
     Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
     if (!mainHand)
         return WarlockStoneSwitchResult::NotRequired;
 
     uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
-    if (!currentEnchantId)
-        return WarlockStoneSwitchResult::NotRequired;
 
-    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(bot);
-    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+    if (desiredStone == "none")
+    {
+        if (!currentEnchantId)
+            return WarlockStoneSwitchResult::NotRequired;
+
+        if (!IsKnownWarlockStoneEnchant(currentEnchantId))
+        {
+            if (BridgeConsoleLogsEnabled())
+            {
+                LOG_INFO(
+                    "playerbots",
+                    "MultiBotBridge warlock stone disable preserved foreign temp enchant bot={} currentEnchant={}",
+                    bot->GetName(),
+                    currentEnchantId);
+            }
+            return WarlockStoneSwitchResult::NotRequired;
+        }
+
+        if (bot->IsInCombat())
+            return WarlockStoneSwitchResult::Failed;
+
+        bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, false);
+        mainHand->ClearEnchantment(TEMP_ENCHANTMENT_SLOT);
+
+        bool const cleared = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == 0;
+        if (!cleared)
+            bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, true);
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge warlock stone disabled bot={} previousEnchant={} cleared={}",
+                bot->GetName(),
+                currentEnchantId,
+                cleared);
+        }
+
+        return cleared ? WarlockStoneSwitchResult::Applied : WarlockStoneSwitchResult::Failed;
+    }
+
+    if (currentEnchantId && !IsKnownWarlockStoneEnchant(currentEnchantId))
     {
         if (BridgeConsoleLogsEnabled())
         {
@@ -12376,18 +12650,30 @@ WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
         return WarlockStoneSwitchResult::NotRequired;
     }
 
-    uint32 const currentEnchantDuration = mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT);
-    uint32 const currentEnchantCharges = mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT);
+    if (currentEnchantId)
+    {
+        std::string const currentKind = ClassifyWarlockStoneEnchant(currentEnchantId);
+        if ((desiredStone == "firestone" && currentKind == "FIRESTONE") ||
+            (desiredStone == "spellstone" && currentKind == "SPELLSTONE"))
+        {
+            return WarlockStoneSwitchResult::NotRequired;
+        }
+    }
+
+    uint32 const currentEnchantDuration =
+        currentEnchantId ? mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT) : 0;
+    uint32 const currentEnchantCharges =
+        currentEnchantId ? mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT) : 0;
 
     // stateScope N selects the non-combat strategy bucket; it is not a runtime combat-state guarantee.
-    // Re-check immediately before touching the equipped enchantment to close the race after the pre-mutation guard.
+    // Re-check immediately before touching or applying the equipped enchantment.
     if (bot->IsInCombat())
     {
         if (BridgeConsoleLogsEnabled())
         {
             LOG_INFO(
                 "playerbots",
-                "MultiBotBridge warlock stone switch skipped bot={} requested={} currentEnchant={} reason=RUNTIME_COMBAT_BEFORE_ENCHANT_CLEAR",
+                "MultiBotBridge warlock stone switch skipped bot={} requested={} currentEnchant={} reason=RUNTIME_COMBAT_BEFORE_ENCHANT_CHANGE",
                 bot->GetName(),
                 desiredStone,
                 currentEnchantId);
@@ -12395,31 +12681,37 @@ WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
         return WarlockStoneSwitchResult::Failed;
     }
 
-    bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, false);
-    mainHand->ClearEnchantment(TEMP_ENCHANTMENT_SLOT);
+    if (currentEnchantId)
+    {
+        bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, false);
+        mainHand->ClearEnchantment(TEMP_ENCHANTMENT_SLOT);
+    }
 
-    bool const applied = botAI->DoSpecificAction(desiredStone, Event(), true);
+    bool const applied = UseWarlockStoneItemSilently(bot, botAI, desiredStone, mainHand);
     if (!applied)
     {
-        // Restore the exact persistent temporary-enchant fields and re-apply its equipped effects/duration tracking.
-        mainHand->SetEnchantment(
-            TEMP_ENCHANTMENT_SLOT,
-            currentEnchantId,
-            currentEnchantDuration,
-            currentEnchantCharges,
-            bot->GetGUID());
-        bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, true);
+        if (currentEnchantId)
+        {
+            // Restore the exact persistent temporary-enchant fields and re-apply its equipped effects/duration tracking.
+            mainHand->SetEnchantment(
+                TEMP_ENCHANTMENT_SLOT,
+                currentEnchantId,
+                currentEnchantDuration,
+                currentEnchantCharges,
+                bot->GetGUID());
+            bot->ApplyEnchantment(mainHand, TEMP_ENCHANTMENT_SLOT, true);
+        }
 
-        bool const restored =
-            mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == currentEnchantId &&
-            mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT) == currentEnchantDuration &&
-            mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT) == currentEnchantCharges;
+        bool const restored = !currentEnchantId ||
+            (mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == currentEnchantId &&
+             mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT) == currentEnchantDuration &&
+             mainHand->GetEnchantmentCharges(TEMP_ENCHANTMENT_SLOT) == currentEnchantCharges);
 
         if (BridgeConsoleLogsEnabled())
         {
             LOG_INFO(
                 "playerbots",
-                "MultiBotBridge warlock stone switch failed bot={} requested={} previousEnchant={} previousDuration={} previousCharges={} enchantRestored={}",
+                "MultiBotBridge warlock stone silent use failed bot={} requested={} previousEnchant={} previousDuration={} previousCharges={} enchantRestored={}",
                 bot->GetName(),
                 desiredStone,
                 currentEnchantId,
@@ -12435,11 +12727,10 @@ WarlockStoneSwitchResult TryForceWarlockStoneSwitch(
     {
         LOG_INFO(
             "playerbots",
-            "MultiBotBridge warlock stone switch bot={} requested={} previousEnchant={} applied={} resultingEnchant={}",
+            "MultiBotBridge warlock stone silent use submitted bot={} requested={} previousEnchant={} resultingEnchant={}",
             bot->GetName(),
             desiredStone,
             currentEnchantId,
-            applied,
             mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT));
     }
 
@@ -12799,12 +13090,12 @@ bool TryGetRequestedWarlockStoneSwitch(
             hasSpellstoneStrategy = operation.enable;
     }
 
-    if (!hadFirestoneStrategy && hadSpellstoneStrategy && hasFirestoneStrategy && !hasSpellstoneStrategy)
-        desiredStone = "firestone";
-    else if (hadFirestoneStrategy && !hadSpellstoneStrategy && !hasFirestoneStrategy && hasSpellstoneStrategy)
-        desiredStone = "spellstone";
-
-    return !desiredStone.empty();
+    return ResolveWarlockStoneDestination(
+        hadFirestoneStrategy,
+        hadSpellstoneStrategy,
+        hasFirestoneStrategy,
+        hasSpellstoneStrategy,
+        desiredStone);
 }
 
 bool RollbackPendingWarlockStoneStrategies(Player* player, PendingWarlockStoneSwitch const& pending)
@@ -13082,11 +13373,10 @@ DeferredWarlockStoneStartResult TryBeginDeferredSelfWarlockStoneSwitch(
         return DeferredWarlockStoneStartResult::NotApplicable;
 
     uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
-    if (!currentEnchantId)
+    if (desiredStone == "none")
         return DeferredWarlockStoneStartResult::NotApplicable;
 
-    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(requester);
-    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+    if (currentEnchantId && !IsKnownWarlockStoneEnchant(currentEnchantId))
         return DeferredWarlockStoneStartResult::NotApplicable;
 
     if (HasNamedWarlockStoneItem(botAI, desiredStone))
@@ -13179,10 +13469,12 @@ struct PendingOrdinaryWarlockStoneSwitch
     ChatMsg replyType = CHAT_MSG_WHISPER;
     std::string desiredStone;
     std::map<std::string, bool> priorStrategyStates;
+    std::set<uint32> expectedEnchantIds;
     bool hadFirestoneStrategy = false;
     bool hadSpellstoneStrategy = false;
     std::size_t applyAttempts = 0;
     bool completionScheduled = false;
+    bool applyStarted = false;
 };
 
 std::map<ObjectGuid, PendingOrdinaryWarlockStoneSwitch> sPendingOrdinaryWarlockStoneSwitches;
@@ -13330,6 +13622,40 @@ void CompletePendingOrdinaryWarlockStoneSwitch(
         return;
     }
 
+    Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_NO_MAINHAND");
+        return;
+    }
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+
+    if (!pending.expectedEnchantIds.empty() &&
+        pending.expectedEnchantIds.find(currentEnchantId) != pending.expectedEnchantIds.end())
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone enchant verified requester={} bot={} requested={} enchant={} attempts={}",
+                requester->GetName(),
+                bot->GetName(),
+                pending.desiredStone,
+                currentEnchantId,
+                pending.applyAttempts);
+        }
+
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, true, "APPLIED");
+        return;
+    }
+
+    if (pending.applyStarted)
+    {
+        SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
+        return;
+    }
+
     if (bot->IsNonMeleeSpellCast(false) || !HasNamedWarlockStoneItem(botAI, pending.desiredStone))
     {
         if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
@@ -13339,6 +13665,19 @@ void CompletePendingOrdinaryWarlockStoneSwitch(
         }
 
         FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_ITEM_NOT_READY");
+        return;
+    }
+
+    pending.expectedEnchantIds = GetCarriedWarlockStoneEnchantIdsForKind(bot, pending.desiredStone);
+    if (pending.expectedEnchantIds.empty())
+    {
+        if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+        {
+            SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
+            return;
+        }
+
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_ENCHANT_ID_NOT_READY");
         return;
     }
 
@@ -13352,18 +13691,50 @@ void CompletePendingOrdinaryWarlockStoneSwitch(
 
     if (result == WarlockStoneSwitchResult::Applied)
     {
+        pending.applyStarted = true;
+        pending.applyAttempts = 0;
+
         if (BridgeConsoleLogsEnabled())
         {
             LOG_INFO(
                 "playerbots",
-                "MultiBotBridge deferred ordinary warlock stone switch applied requester={} bot={} requested={} attempts={}",
+                "MultiBotBridge deferred ordinary warlock stone apply started requester={} bot={} requested={} expectedEnchantCount={}",
                 requester->GetName(),
                 bot->GetName(),
                 pending.desiredStone,
-                pending.applyAttempts);
+                pending.expectedEnchantIds.size());
         }
 
-        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, true, "APPLIED");
+        bot->m_Events.AddEventAtOffset(
+            [bot, botGuid, token]()
+            {
+                auto const pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+                if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() ||
+                    pendingIt->second.token != token ||
+                    !pendingIt->second.applyStarted)
+                {
+                    return;
+                }
+
+                if (BridgeConsoleLogsEnabled())
+                {
+                    LOG_INFO(
+                        "playerbots",
+                        "MultiBotBridge deferred ordinary warlock stone apply timeout bot={} requested={}",
+                        bot ? bot->GetName() : pendingIt->second.target,
+                        pendingIt->second.desiredStone);
+                }
+
+                FinishPendingOrdinaryWarlockStoneSwitch(
+                    bot,
+                    botGuid,
+                    token,
+                    false,
+                    "STONE_APPLY_TIMEOUT");
+            },
+            kWarlockStoneSwitchApplyTimeout);
+
+        SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
         return;
     }
 
@@ -13395,16 +13766,24 @@ void TimeoutPendingOrdinaryWarlockStoneSwitch(
     if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.token != token)
         return;
 
+    if (pendingIt->second.applyStarted)
+        return;
+
     if (BridgeConsoleLogsEnabled())
     {
         LOG_INFO(
             "playerbots",
-            "MultiBotBridge deferred ordinary warlock stone switch timeout bot={} requested={}",
+            "MultiBotBridge deferred ordinary warlock stone create timeout bot={} requested={}",
             bot ? bot->GetName() : pendingIt->second.target,
             pendingIt->second.desiredStone);
     }
 
-    FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, false, "STONE_CREATE_TIMEOUT");
+    FinishPendingOrdinaryWarlockStoneSwitch(
+        bot,
+        botGuid,
+        token,
+        false,
+        "STONE_CREATE_TIMEOUT");
 }
 
 void NotifyPendingOrdinaryWarlockStoneItemCreated(Player* player, Item* item)
@@ -13553,15 +13932,13 @@ DeferredOrdinaryWarlockStoneStartResult TryBeginDeferredOrdinaryWarlockStoneSwit
         return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
 
     uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
-    if (!currentEnchantId)
+    if (desiredStone == "none")
         return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
 
-    std::set<uint32> const carriedStoneEnchantIds = GetCarriedWarlockStoneEnchantIds(bot);
-    if (carriedStoneEnchantIds.find(currentEnchantId) == carriedStoneEnchantIds.end())
+    if (currentEnchantId && !IsKnownWarlockStoneEnchant(currentEnchantId))
         return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
 
-    if (HasNamedWarlockStoneItem(botAI, desiredStone))
-        return DeferredOrdinaryWarlockStoneStartResult::NotApplicable;
+    bool const desiredStoneAlreadyCarried = HasNamedWarlockStoneItem(botAI, desiredStone);
 
     if (bot->IsInCombat())
     {
@@ -13607,6 +13984,32 @@ DeferredOrdinaryWarlockStoneStartResult TryBeginDeferredOrdinaryWarlockStoneSwit
             TimeoutPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token);
         },
         kWarlockStoneSwitchCreateTimeout);
+
+    if (desiredStoneAlreadyCarried)
+    {
+        auto pendingIt = sPendingOrdinaryWarlockStoneSwitches.find(botGuid);
+        if (pendingIt == sPendingOrdinaryWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        {
+            failureReason = "STONE_PENDING_STATE_LOST";
+            return DeferredOrdinaryWarlockStoneStartResult::Failed;
+        }
+
+        pendingIt->second.completionScheduled = true;
+
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred ordinary warlock stone existing item scheduled requester={} bot={} requested={} token={}",
+                requester->GetName(),
+                bot->GetName(),
+                desiredStone,
+                token);
+        }
+
+        SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
+        return DeferredOrdinaryWarlockStoneStartResult::Started;
+    }
 
     std::string const createAction = "create " + desiredStone;
     if (!botAI->DoSpecificAction(createAction, Event(), true))
@@ -15824,6 +16227,88 @@ void SendWeaponEnchantDebugPacket(
         << kFieldSeparator << offDuration;
 
     SendAddonPacket(requester, replyType, "WEAPON_ENCHANT", payload.str());
+}
+
+bool ConsumeWarlockStoneStateRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < std::chrono::milliseconds(500))
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 512)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(60))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+void SendWarlockStoneStatePacket(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& token)
+{
+    std::string status = "OK";
+    std::string kind = "NONE";
+    uint32 enchantId = 0;
+    uint32 duration = 0;
+
+    Player* const bot = FindBotByName(requester, botName);
+    if (!ConsumeWarlockStoneStateRateLimit(requester))
+    {
+        status = "RATE_LIMIT";
+    }
+    else if (!bot)
+    {
+        status = "BOT_NOT_VISIBLE";
+    }
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            status = "FORBIDDEN";
+        }
+        else
+        {
+            Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            if (mainHand)
+            {
+                enchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                duration = mainHand->GetEnchantmentDuration(TEMP_ENCHANTMENT_SLOT);
+            }
+
+            if (enchantId != 0)
+                kind = ClassifyWarlockStoneEnchant(enchantId);
+        }
+    }
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(bot ? bot->GetName() : Trim(botName))
+        << kFieldSeparator << status
+        << kFieldSeparator << kind
+        << kFieldSeparator << enchantId
+        << kFieldSeparator << duration;
+
+    SendAddonPacket(requester, replyType, "WARLOCK_STONE_STATE", payload.str());
 }
 
 std::string JoinStrategies(std::vector<std::string> const& strategies)
@@ -18479,6 +18964,23 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             SendWeaponEnchantDebugPacket(player, replyType, botName, fields[2]);
+            return true;
+        }
+
+        if (requestType == "WARLOCK_STONE_STATE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            std::string botName;
+            if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            SendWarlockStoneStatePacket(player, replyType, botName, fields[2]);
             return true;
         }
 
