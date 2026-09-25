@@ -189,6 +189,11 @@ std::chrono::seconds constexpr kBotMaintenanceRateWindow(10);
 std::chrono::seconds constexpr kBotMaintenanceReplayTtl(30);
 std::size_t constexpr kBotMaintenanceMaxRecentTokens = 32;
 std::size_t constexpr kBotMaintenanceMaxRequesterStates = 512;
+std::size_t constexpr kBotWipeRateLimit = 8;
+std::chrono::milliseconds constexpr kBotWipeRateWindow(2000);
+std::chrono::seconds constexpr kBotWipeReplayTtl(10);
+std::size_t constexpr kBotWipeMaxRecentTokens = 64;
+std::size_t constexpr kBotWipeMaxRequesterStates = 512;
 std::size_t constexpr kSpellbookCastRateLimit = 8;
 std::chrono::milliseconds constexpr kSpellbookCastRateWindow(2000);
 std::chrono::seconds constexpr kSpellbookCastReplayTtl(10);
@@ -202,7 +207,7 @@ std::size_t constexpr kSpellbookIgnoreMaxRequesterStates = 512;
 uint32 constexpr kSpellbookCastGravityLapseTk = 39432;
 uint32 constexpr kSpellbookCastGravityLapseMgt = 44226;
 std::size_t constexpr kWarlockStoneSwitchMaxPending = 512;
-std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 20;
+std::size_t constexpr kWarlockStoneSwitchMaxApplyAttempts = 35;
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyRetryDelay(100);
 std::chrono::milliseconds constexpr kWarlockStoneSwitchCreateTimeout(7000);
 std::chrono::milliseconds constexpr kWarlockStoneSwitchApplyTimeout(3500);
@@ -243,6 +248,7 @@ char const* const kLootRuleItemCapability = "LOOT_RULE_ITEM_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
+char const* const kGlyphEquipCapability = "GLYPH_EQUIP_V1";
 char const* const kCraftRecipeTargetCapability = "CRAFT_RECIPE_TARGET_V1";
 char const* const kGroupRollCapability = "GROUP_ROLL_V1";
 char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
@@ -276,6 +282,9 @@ char const* const kQuestRewardCapability = "QUEST_REWARD_V1";
 char const* const kQuestRewardPolicyCapability = "QUEST_REWARD_POLICY_V1";
 char const* const kAutogearOptionsCapability = "AUTOGEAR_OPTIONS_V1";
 char const* const kBotMaintenanceCapability = "BOT_MAINTENANCE_V1";
+char const* const kBotWipeCapability = "BOT_WIPE_V1";
+char const* const kBotSummonCapability = "BOT_SUMMON_V1";
+char const* const kBotReleaseCapability = "BOT_RELEASE_V1";
 char const* const kSpellbookCastCapability = "SPELLBOOK_CAST_V1";
 char const* const kSpellbookIgnoreCapability = "SPELLBOOK_IGNORE_V1";
 char const* const kWarlockStoneStateCapability = "WARLOCK_STONE_STATE_V1";
@@ -348,6 +357,8 @@ bool IsBotMasteredByRequester(Player* requester, Player* bot);
 void RunFleeOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& audienceValue, std::string const& targetName);
 void RunGroupActionCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& actionValue);
 void RunBotMaintenanceCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void RunBotWipeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void RunBotSummonCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunQuestAcceptAllCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -415,6 +426,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kQuestAbandonCapability,
         kTalentApplyCapability,
         kTalentSpecApplyCapability,
+        kGlyphEquipCapability,
         kCraftRecipeTargetCapability,
         kGroupRollCapability,
         kEnchantTradeCapability,
@@ -445,6 +457,9 @@ kQuestAcceptAllCapability,
         kQuestRewardPolicyCapability,
         kAutogearOptionsCapability,
         kBotMaintenanceCapability,
+        kBotWipeCapability,
+        kBotSummonCapability,
+        kBotReleaseCapability,
         kSpellbookCastCapability,
         kSpellbookIgnoreCapability,
         kWarlockStoneStateCapability
@@ -5535,6 +5550,15 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix, bool
     return false;
 }
 
+void SetPlayerbotFeedbackRoute(PlayerbotAI* botAI, Player* requester, bool addonRoute)
+{
+    if (!botAI || !requester)
+        return;
+
+    std::string const routeCommand = sPlayerbotAIConfig.commandPrefix + (addonRoute ? "#a " : "#w ");
+    botAI->HandleCommand(CHAT_MSG_PARTY, routeCommand, requester);
+}
+
 bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& command)
 {
     if (!requester || !bot || command.empty())
@@ -5544,7 +5568,8 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
     if (!botAI)
         return false;
 
-    botAI->HandleCommand(CHAT_MSG_WHISPER, command, requester);
+    std::string const routedCommand = sPlayerbotAIConfig.commandPrefix + "#a " + command;
+    botAI->HandleCommand(CHAT_MSG_WHISPER, routedCommand, requester);
     return true;
 }
 
@@ -7006,7 +7031,239 @@ void RunTalentSpecApplyCommand(
 
     SendAddonPacket(requester, replyType, "TALENT_SPEC_APPLY_RESULT", payload.str());
 }
-// MB_TALENT_SPEC_APPLY_V1_END// MB_QUEST_ABANDON_V1_BEGIN
+// MB_TALENT_SPEC_APPLY_V1_END
+
+// MB_GLYPH_EQUIP_V1_BEGIN
+struct GlyphEquipRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<std::string, GlyphEquipRateState> sGlyphEquipRateStates;
+std::size_t constexpr kGlyphEquipRateLimit = 4;
+std::chrono::milliseconds constexpr kGlyphEquipRateWindow(2000);
+std::chrono::seconds constexpr kGlyphEquipReplayTtl(10);
+std::size_t constexpr kGlyphEquipMaxRecentTokens = 32;
+std::size_t constexpr kGlyphEquipMaxRequesterStates = 512;
+
+bool ConsumeGlyphEquipRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    auto const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetGUID().ToString();
+    auto stateIt = sGlyphEquipRateStates.find(key);
+    if (stateIt == sGlyphEquipRateStates.end())
+    {
+        if (sGlyphEquipRateStates.size() >= kGlyphEquipMaxRequesterStates)
+        {
+            for (auto it = sGlyphEquipRateStates.begin(); it != sGlyphEquipRateStates.end();)
+            {
+                while (!it->second.requests.empty() && now - it->second.requests.front() >= kGlyphEquipRateWindow)
+                    it->second.requests.pop_front();
+                while (!it->second.recentTokens.empty() && now - it->second.recentTokens.front().second >= kGlyphEquipReplayTtl)
+                    it->second.recentTokens.pop_front();
+
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sGlyphEquipRateStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+        if (sGlyphEquipRateStates.size() >= kGlyphEquipMaxRequesterStates)
+            return false;
+        stateIt = sGlyphEquipRateStates.emplace(key, GlyphEquipRateState{}).first;
+    }
+
+    GlyphEquipRateState& state = stateIt->second;
+    while (!state.requests.empty() && now - state.requests.front() >= kGlyphEquipRateWindow)
+        state.requests.pop_front();
+    if (state.requests.size() >= kGlyphEquipRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+    return true;
+}
+
+bool RegisterGlyphEquipToken(Player* requester, std::string const& token)
+{
+    if (!requester || token.empty())
+        return false;
+
+    auto const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetGUID().ToString();
+    auto stateIt = sGlyphEquipRateStates.find(key);
+    if (stateIt == sGlyphEquipRateStates.end())
+        return false;
+
+    GlyphEquipRateState& state = stateIt->second;
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kGlyphEquipReplayTtl)
+        state.recentTokens.pop_front();
+
+    for (auto const& entry : state.recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state.recentTokens.emplace_back(token, now);
+    while (state.recentTokens.size() > kGlyphEquipMaxRecentTokens)
+        state.recentTokens.pop_front();
+    return true;
+}
+
+struct BridgeGlyphInfo
+{
+    GlyphPropertiesEntry const* prop = nullptr;
+    ItemTemplate const* proto = nullptr;
+};
+
+bool ResolveBridgeGlyph(uint32 itemId, BridgeGlyphInfo& out)
+{
+    out = BridgeGlyphInfo{};
+    if (!itemId)
+        return false;
+
+    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto || proto->Class != ITEM_CLASS_GLYPH)
+        return false;
+
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+    {
+        uint32 const spellId = proto->Spells[i].SpellId;
+        if (!spellId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            continue;
+
+        for (uint8 effectIndex = 0; effectIndex <= EFFECT_2; ++effectIndex)
+        {
+            if (spellInfo->Effects[effectIndex].Effect != SPELL_EFFECT_APPLY_GLYPH)
+                continue;
+
+            uint32 const glyphId = spellInfo->Effects[effectIndex].MiscValue;
+            GlyphPropertiesEntry const* const prop = glyphId ? sGlyphPropertiesStore.LookupEntry(glyphId) : nullptr;
+            if (prop)
+            {
+                out.prop = prop;
+                out.proto = proto;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void RunGlyphEquipCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botName,
+    std::string const& requestToken,
+    std::array<uint32, 6> const& itemIds)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    std::string reason = "OK";
+
+    if (!requester || !requester->GetSession())
+        reason = "BAD_REQUEST";
+    else if (!ConsumeGlyphEquipRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterGlyphEquipToken(requester, token))
+        reason = "DUPLICATE";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else
+    {
+        std::array<BridgeGlyphInfo, 6> glyphs;
+        std::unordered_set<uint32> seen;
+
+        for (std::size_t i = 0; i < itemIds.size() && reason == "OK"; ++i)
+        {
+            uint32 const itemId = itemIds[i];
+            if (!itemId || !seen.insert(itemId).second || !ResolveBridgeGlyph(itemId, glyphs[i]))
+                reason = "BAD_GLYPH";
+            else if ((glyphs[i].proto->AllowableClass & bot->getClassMask()) == 0)
+                reason = "WRONG_CLASS";
+        }
+
+        if (reason == "OK")
+        {
+            bool used[6] = {false, false, false, false, false, false};
+
+            for (BridgeGlyphInfo const& glyph : glyphs)
+            {
+                bool placed = false;
+                for (uint8 slot = 0; slot < MAX_GLYPH_SLOT_INDEX; ++slot)
+                {
+                    if (used[slot])
+                        continue;
+
+                    uint32 const slotId = bot->GetGlyphSlot(slot);
+                    GlyphSlotEntry const* const glyphSlot = sGlyphSlotStore.LookupEntry(slotId);
+                    if (!glyphSlot || glyphSlot->TypeFlags != glyph.prop->TypeFlags)
+                        continue;
+
+                    uint32 const currentGlyph = bot->GetGlyph(slot);
+                    if (currentGlyph)
+                    {
+                        if (GlyphPropertiesEntry const* const oldGlyph = sGlyphPropertiesStore.LookupEntry(currentGlyph))
+                            bot->RemoveAurasDueToSpell(oldGlyph->SpellId);
+                    }
+
+                    bot->CastSpell(bot, glyph.prop->SpellId, true);
+                    bot->SetGlyph(slot, glyph.prop->Id, true);
+                    used[slot] = true;
+                    placed = true;
+                    break;
+                }
+
+                if (!placed)
+                {
+                    reason = "SOCKET_MISMATCH";
+                    break;
+                }
+            }
+
+            if (reason == "OK")
+            {
+                auto* const customGlyphs = botAI->GetAiObjectContext()->GetValue<bool>("custom_glyphs");
+                if (!customGlyphs)
+                    reason = "NO_CONTEXT";
+                else
+                {
+                    customGlyphs->Set(true);
+                    botAI->ResetStrategies();
+                }
+            }
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason);
+    for (uint32 itemId : itemIds)
+        payload << kFieldSeparator << itemId;
+
+    SendAddonPacket(requester, replyType, "GLYPH_EQUIP_RESULT", payload.str());
+}
+// MB_GLYPH_EQUIP_V1_END
+// MB_QUEST_ABANDON_V1_BEGIN
 
 struct QuestAbandonRateState
 {
@@ -9484,7 +9741,10 @@ bool ApplyNativeGroupOrder(Player* requester, Player* bot, bool follow)
     }
 
     std::string const actionName = follow ? "follow chat shortcut" : "stay chat shortcut";
-    if (!botAI->DoSpecificAction(actionName, Event(actionName, "", requester), true))
+    SetPlayerbotFeedbackRoute(botAI, requester, true);
+    bool const executed = botAI->DoSpecificAction(actionName, Event(actionName, "", requester), true);
+    SetPlayerbotFeedbackRoute(botAI, requester, false);
+    if (!executed)
         return false;
 
     if (follow)
@@ -10496,10 +10756,21 @@ bool ApplyNativeGroupAction(
         return false;
     }
 
-    return botAI->DoSpecificAction(
+    if (nativeActionName == "drink")
+    {
+        return botAI->DoSpecificAction(
+            nativeActionName,
+            Event(nativeActionName, "", requester),
+            true);
+    }
+
+    SetPlayerbotFeedbackRoute(botAI, requester, true);
+    bool const executed = botAI->DoSpecificAction(
         nativeActionName,
         Event(nativeActionName, "", requester),
         true);
+    SetPlayerbotFeedbackRoute(botAI, requester, false);
+    return executed;
 }
 
 void SendGroupActionAck(
@@ -10620,6 +10891,110 @@ void RunGroupActionCommand(
         reason);
 }
 // MB_GROUP_ACTION_V1_END
+// MB_BOT_SUMMON_V1_BEGIN
+void SendBotSummonAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    std::string const& botName,
+    bool ok,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "BOT_SUMMON_ACK", payload.str());
+}
+
+void RunBotSummonCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    std::string const effectiveBotName = bot ? bot->GetName() : botName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession() || !requester->IsInWorld())
+        reason = "NO_SESSION";
+    else if (!ConsumeGroupOrderRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterGroupOrderToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (bot == requester)
+        reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!IsBotMasteredByRequester(requester, bot))
+        reason = "NOT_MASTER";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else
+    {
+        ok = ApplyNativeGroupAction(requester, bot, "summon");
+        reason = ok ? "OK" : "FAILED";
+    }
+
+    SendBotSummonAck(requester, replyType, token, effectiveBotName, ok, reason);
+}
+// MB_BOT_SUMMON_V1_END
+// MB_BOT_RELEASE_V1_BEGIN
+void SendBotReleaseAck(Player* requester, ChatMsg replyType, std::string const& token, std::string const& botName, bool ok, std::string const& reason)
+{
+    if (!requester) return;
+    std::ostringstream payload;
+    payload << token << kFieldSeparator << UrlEncodeField(botName) << kFieldSeparator << (ok ? "OK" : "ERR") << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "BOT_RELEASE_ACK", payload.str());
+}
+
+void RunBotReleaseCommand(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& requestToken)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    std::string const effectiveBotName = bot ? bot->GetName() : botName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+    if (!requester || !requester->GetSession() || !requester->IsInWorld()) reason = "NO_SESSION";
+    else if (!ConsumeGroupOrderRateLimit(requester)) reason = "RATE_LIMIT";
+    else if (!RegisterGroupOrderToken(requester, token)) reason = "REPLAY";
+    else if (!bot) reason = "NO_BOT";
+    else if (bot == requester) reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld()) reason = "BOT_UNAVAILABLE";
+    else if (!botAI) reason = "NO_AI";
+    else if (!IsBotMasteredByRequester(requester, bot)) reason = "NOT_MASTER";
+    else if (!botAI->GetSecurity() || !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester)) reason = "FORBIDDEN";
+    else if (bot->IsAlive()) reason = "BOT_ALIVE";
+    else { ok = ApplyNativeGroupAction(requester, bot, "release"); reason = ok ? "OK" : "FAILED"; }
+    SendBotReleaseAck(requester, replyType, token, effectiveBotName, ok, reason);
+}
+
+void NotifyBotDeath(Player* bot)
+{
+    if (!bot || bot->IsAlive()) return;
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    Player* const requester = botAI ? botAI->GetMaster() : nullptr;
+    if (!requester || requester == bot || !requester->GetSession() || !requester->IsInWorld()) return;
+    if (!IsBotMasteredByRequester(requester, bot)) return;
+    SendAddonPacket(requester, CHAT_MSG_WHISPER, "BOT_DEATH", UrlEncodeField(bot->GetName()));
+}
+// MB_BOT_RELEASE_V1_END
 // MB_QUEST_ACCEPT_ALL_V1_BEGIN
 std::set<uint32> CaptureQuestLogIds(Player* bot)
 {
@@ -11704,19 +12079,27 @@ bool ApplyNativeRtscOrder(
         if (requester->HasSpell(rtscMoveSpell))
             return true;
 
+        SetPlayerbotFeedbackRoute(botAI, requester, true);
         botAI->DoSpecificAction(
             "rtsc",
             Event("rtsc", "", requester),
             true);
+        SetPlayerbotFeedbackRoute(botAI, requester, false);
 
         return requester->HasSpell(rtscMoveSpell);
     }
 
     std::string const nativeParam = GetNativeRtscParam(operation, slot);
+    if (operation == "RESET")
+        SetPlayerbotFeedbackRoute(botAI, requester, true);
+
     bool const executed = botAI->DoSpecificAction(
         "rtsc",
         Event("rtsc", nativeParam, requester),
         true);
+
+    if (operation == "RESET")
+        SetPlayerbotFeedbackRoute(botAI, requester, false);
 
     if (executed)
         return true;
@@ -12382,6 +12765,13 @@ std::string ClassifyWarlockStoneEnchant(uint32 enchantId)
     return "OTHER";
 }
 
+bool IsWarlockStoneEnchantForKind(uint32 enchantId, std::string const& stoneName)
+{
+    std::string const kind = ClassifyWarlockStoneEnchant(enchantId);
+    return (stoneName == "firestone" && kind == "FIRESTONE") ||
+        (stoneName == "spellstone" && kind == "SPELLSTONE");
+}
+
 enum class WarlockStoneSwitchResult
 {
     NotRequired,
@@ -13037,10 +13427,12 @@ struct PendingWarlockStoneSwitch
     ChatMsg replyType = CHAT_MSG_WHISPER;
     std::string desiredStone;
     std::map<std::string, bool> priorStrategyStates;
+    std::set<uint32> expectedEnchantIds;
     bool hadFirestoneStrategy = false;
     bool hadSpellstoneStrategy = false;
     std::size_t applyAttempts = 0;
     bool completionScheduled = false;
+    bool applyStarted = false;
 };
 
 std::map<std::string, PendingWarlockStoneSwitch> sPendingWarlockStoneSwitches;
@@ -13188,6 +13580,39 @@ void CompletePendingWarlockStoneSwitch(Player* player, std::string const& key, s
         return;
     }
 
+    Item* const mainHand = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    if (!mainHand)
+    {
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_NO_MAINHAND");
+        return;
+    }
+
+    uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (IsWarlockStoneEnchantForKind(currentEnchantId, pending.desiredStone) ||
+        (!pending.expectedEnchantIds.empty() &&
+         pending.expectedEnchantIds.find(currentEnchantId) != pending.expectedEnchantIds.end()))
+    {
+        if (BridgeConsoleLogsEnabled())
+        {
+            LOG_INFO(
+                "playerbots",
+                "MultiBotBridge deferred warlock stone enchant verified player={} requested={} enchant={} attempts={}",
+                player->GetName(),
+                pending.desiredStone,
+                currentEnchantId,
+                pending.applyAttempts);
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, true, "APPLIED");
+        return;
+    }
+
+    if (pending.applyStarted)
+    {
+        SchedulePendingWarlockStoneCompletion(player, key, token);
+        return;
+    }
+
     if (player->IsNonMeleeSpellCast(false) || !HasNamedWarlockStoneItem(botAI, pending.desiredStone))
     {
         if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
@@ -13197,6 +13622,19 @@ void CompletePendingWarlockStoneSwitch(Player* player, std::string const& key, s
         }
 
         FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_ITEM_NOT_READY");
+        return;
+    }
+
+    pending.expectedEnchantIds = GetCarriedWarlockStoneEnchantIdsForKind(player, pending.desiredStone);
+    if (pending.expectedEnchantIds.empty())
+    {
+        if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+        {
+            SchedulePendingWarlockStoneCompletion(player, key, token);
+            return;
+        }
+
+        FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_ENCHANT_ID_NOT_READY");
         return;
     }
 
@@ -13210,23 +13648,67 @@ void CompletePendingWarlockStoneSwitch(Player* player, std::string const& key, s
 
     if (result == WarlockStoneSwitchResult::Applied)
     {
+        pending.applyStarted = true;
+        pending.applyAttempts = 0;
+
         if (BridgeConsoleLogsEnabled())
         {
             LOG_INFO(
                 "playerbots",
-                "MultiBotBridge deferred warlock stone switch applied player={} requested={} attempts={}",
+                "MultiBotBridge deferred warlock stone apply started player={} requested={} expectedEnchantCount={}",
                 player->GetName(),
                 pending.desiredStone,
-                pending.applyAttempts);
+                pending.expectedEnchantIds.size());
         }
 
+        player->m_Events.AddEventAtOffset(
+            [player, key, token]()
+            {
+                auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
+                if (pendingIt == sPendingWarlockStoneSwitches.end() ||
+                    pendingIt->second.token != token ||
+                    !pendingIt->second.applyStarted)
+                {
+                    return;
+                }
+
+                if (BridgeConsoleLogsEnabled())
+                {
+                    LOG_INFO(
+                        "playerbots",
+                        "MultiBotBridge deferred warlock stone apply timeout player={} requested={}",
+                        player ? player->GetName() : key,
+                        pendingIt->second.desiredStone);
+                }
+
+                FinishPendingWarlockStoneSwitch(
+                    player,
+                    key,
+                    token,
+                    false,
+                    "STONE_APPLY_TIMEOUT");
+            },
+            kWarlockStoneSwitchApplyTimeout);
+
+        SchedulePendingWarlockStoneCompletion(player, key, token);
+        return;
+    }
+
+    uint32 const refreshedEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (IsWarlockStoneEnchantForKind(refreshedEnchantId, pending.desiredStone))
+    {
         FinishPendingWarlockStoneSwitch(player, key, token, true, "APPLIED");
+        return;
+    }
+
+    if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+    {
+        SchedulePendingWarlockStoneCompletion(player, key, token);
         return;
     }
 
     FinishPendingWarlockStoneSwitch(player, key, token, false, "STONE_APPLY_FAILED");
 }
-
 void SchedulePendingWarlockStoneCompletion(Player* player, std::string const& key, std::string const& token)
 {
     if (!player)
@@ -13244,6 +13726,9 @@ void TimeoutPendingWarlockStoneSwitch(Player* player, std::string const& key, st
 {
     auto const pendingIt = sPendingWarlockStoneSwitches.find(key);
     if (pendingIt == sPendingWarlockStoneSwitches.end() || pendingIt->second.token != token)
+        return;
+
+    if (pendingIt->second.applyStarted)
         return;
 
     if (BridgeConsoleLogsEnabled())
@@ -13631,8 +14116,9 @@ void CompletePendingOrdinaryWarlockStoneSwitch(
 
     uint32 const currentEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
 
-    if (!pending.expectedEnchantIds.empty() &&
-        pending.expectedEnchantIds.find(currentEnchantId) != pending.expectedEnchantIds.end())
+    if (IsWarlockStoneEnchantForKind(currentEnchantId, pending.desiredStone) ||
+        (!pending.expectedEnchantIds.empty() &&
+         pending.expectedEnchantIds.find(currentEnchantId) != pending.expectedEnchantIds.end()))
     {
         if (BridgeConsoleLogsEnabled())
         {
@@ -13734,6 +14220,19 @@ void CompletePendingOrdinaryWarlockStoneSwitch(
             },
             kWarlockStoneSwitchApplyTimeout);
 
+        SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
+        return;
+    }
+
+    uint32 const refreshedEnchantId = mainHand->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+    if (IsWarlockStoneEnchantForKind(refreshedEnchantId, pending.desiredStone))
+    {
+        FinishPendingOrdinaryWarlockStoneSwitch(bot, botGuid, token, true, "APPLIED");
+        return;
+    }
+
+    if (pending.applyAttempts < kWarlockStoneSwitchMaxApplyAttempts)
+    {
         SchedulePendingOrdinaryWarlockStoneCompletion(bot, botGuid, token);
         return;
     }
@@ -15328,6 +15827,156 @@ void RunBotMaintenanceCommand(
     SendBotMaintenanceAck(requester, replyType, token, effectiveBotName, ok, reason);
 }
 // MB_BOT_MAINTENANCE_V1_END
+
+// MB_BOT_WIPE_V1_BEGIN
+struct BotWipeRequestState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::map<uint64, BotWipeRequestState> gBotWipeRequestStates;
+
+void PruneBotWipeRequestState(
+    BotWipeRequestState& state,
+    std::chrono::steady_clock::time_point const now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kBotWipeRateWindow)
+        state.requests.pop_front();
+
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kBotWipeReplayTtl)
+        state.recentTokens.pop_front();
+
+    while (state.recentTokens.size() > kBotWipeMaxRecentTokens)
+        state.recentTokens.pop_front();
+}
+
+BotWipeRequestState* GetBotWipeRequestState(Player* requester)
+{
+    if (!requester)
+        return nullptr;
+
+    auto const now = std::chrono::steady_clock::now();
+    uint64 const key = requester->GetGUID().GetCounter();
+    auto stateIt = gBotWipeRequestStates.find(key);
+
+    if (stateIt == gBotWipeRequestStates.end())
+    {
+        if (gBotWipeRequestStates.size() >= kBotWipeMaxRequesterStates)
+        {
+            for (auto it = gBotWipeRequestStates.begin(); it != gBotWipeRequestStates.end();)
+            {
+                PruneBotWipeRequestState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = gBotWipeRequestStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (gBotWipeRequestStates.size() >= kBotWipeMaxRequesterStates)
+            return nullptr;
+
+        stateIt = gBotWipeRequestStates.emplace(key, BotWipeRequestState{}).first;
+    }
+
+    PruneBotWipeRequestState(stateIt->second, now);
+    return &stateIt->second;
+}
+
+bool ConsumeBotWipeRateLimit(Player* requester)
+{
+    BotWipeRequestState* const state = GetBotWipeRequestState(requester);
+    if (!state)
+        return false;
+
+    if (state->requests.size() >= kBotWipeRateLimit)
+        return false;
+
+    state->requests.push_back(std::chrono::steady_clock::now());
+    return true;
+}
+
+bool RegisterBotWipeToken(Player* requester, std::string const& token)
+{
+    BotWipeRequestState* const state = GetBotWipeRequestState(requester);
+    if (!state)
+        return false;
+
+    for (auto const& entry : state->recentTokens)
+        if (entry.first == token)
+            return false;
+
+    state->recentTokens.emplace_back(token, std::chrono::steady_clock::now());
+    while (state->recentTokens.size() > kBotWipeMaxRecentTokens)
+        state->recentTokens.pop_front();
+    return true;
+}
+
+void SendBotWipeAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& token,
+    std::string const& botName,
+    bool ok,
+    std::string const& reason)
+{
+    if (!requester)
+        return;
+
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "BOT_WIPE_ACK", payload.str());
+}
+
+void RunBotWipeCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken)
+{
+    std::string const botName = Trim(botNameValue);
+    std::string const token = Trim(requestToken);
+    Player* const bot = requester ? FindBotByName(requester, botName) : nullptr;
+    std::string const effectiveBotName = bot ? bot->GetName() : botName;
+    PlayerbotAI* const botAI = bot ? GetBotAI(bot) : nullptr;
+    bool ok = false;
+    std::string reason = "BAD_REQUEST";
+
+    if (!requester || !requester->GetSession() || !requester->IsInWorld())
+        reason = "NO_SESSION";
+    else if (!ConsumeBotWipeRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!RegisterBotWipeToken(requester, token))
+        reason = "REPLAY";
+    else if (!bot)
+        reason = "NO_BOT";
+    else if (bot == requester)
+        reason = "SELF_NOT_ALLOWED";
+    else if (!bot->GetSession() || !bot->IsInWorld())
+        reason = "BOT_UNAVAILABLE";
+    else if (!botAI)
+        reason = "NO_AI";
+    else if (!IsBotMasteredByRequester(requester, bot))
+        reason = "NOT_MASTER";
+    else if (!botAI->GetSecurity() ||
+             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        reason = "FORBIDDEN";
+    else if (!bot->IsAlive())
+        reason = "ALREADY_DEAD";
+    else
+    {
+        bot->Kill(bot, bot);
+        ok = !bot->IsAlive();
+        reason = ok ? "OK" : "FAILED";
+    }
+
+    SendBotWipeAck(requester, replyType, token, effectiveBotName, ok, reason);
+}
+// MB_BOT_WIPE_V1_END
 
 void RunSelfActionCommand(
     Player* requester,
@@ -17897,10 +18546,13 @@ bool ApplyNativeFleeOrder(Player* requester, Player* bot)
         return false;
     }
 
-    return botAI->DoSpecificAction(
+    SetPlayerbotFeedbackRoute(botAI, requester, true);
+    bool const executed = botAI->DoSpecificAction(
         "flee chat shortcut",
         Event("flee chat shortcut", "", requester),
         true);
+    SetPlayerbotFeedbackRoute(botAI, requester, false);
+    return executed;
 }
 
 void SendFleeOrderAck(
@@ -19612,6 +20264,29 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "GLYPH_EQUIP")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 9)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT");
+
+        std::array<uint32, 6> itemIds = {0, 0, 0, 0, 0, 0};
+        for (std::size_t i = 0; i < itemIds.size(); ++i)
+        {
+            if (!TryParseUint32Field(fields[3 + i], 0, std::numeric_limits<uint32>::max(), itemIds[i]))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_GLYPH");
+        }
+
+        RunGlyphEquipCommand(player, replyType, botName, fields[1], itemIds);
+        return true;
+    }
+
     if (requestType == "QUEST_ABANDON")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
@@ -20384,6 +21059,69 @@ if (requestType == "HUNTER_PET_MANAGE")
     }
     // MB_BOT_MAINTENANCE_V1_DISPATCH_END
 
+    // MB_BOT_WIPE_V1_DISPATCH_BEGIN
+    if (requestType == "BOT_WIPE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 3)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+            botName != Trim(botName) || botName.empty())
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        }
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        RunBotWipeCommand(player, replyType, botName, fields[2]);
+        return true;
+    }
+    // MB_BOT_WIPE_V1_DISPATCH_END
+
+    // MB_BOT_SUMMON_V1_DISPATCH_BEGIN
+    if (requestType == "BOT_SUMMON")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 3)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) ||
+            botName != Trim(botName) || botName.empty())
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        }
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        RunBotSummonCommand(player, replyType, botName, fields[2]);
+        return true;
+    }
+    // MB_BOT_SUMMON_V1_DISPATCH_END
+    // MB_BOT_RELEASE_V1_DISPATCH_BEGIN
+    if (requestType == "BOT_RELEASE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 3) return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+        if (!IsValidEncodedField(fields[1], kMaxBotNameLength, false)) return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        std::string botName;
+        if (!TryUrlDecodeField(fields[1], botName, kMaxBotNameLength, false) || botName != Trim(botName) || botName.empty()) return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+        if (!IsValidRequestToken(fields[2])) return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+        RunBotReleaseCommand(player, replyType, botName, fields[2]);
+        return true;
+    }
+    // MB_BOT_RELEASE_V1_DISPATCH_END
+
     if (requestType == "STRATEGY")
     {
         std::string const token = GetSafeErrorToken(fields, 3);
@@ -20508,6 +21246,11 @@ public:
         }
 
         return HandleBridgeOpcode(player, replyType, packet.first, packet.second);
+    }
+
+    void OnPlayerJustDied(Player* player) override
+    {
+        NotifyBotDeath(player);
     }
 
     void OnPlayerCreateItem(Player* player, Item* item, uint32 /*count*/) override
