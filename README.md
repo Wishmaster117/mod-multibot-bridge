@@ -558,3 +558,14 @@ Confirm that:
 ### The addon reports Bridge unavailable
 
 Confirm the client is using the matching MultiBot Chatless addon and that the worldserver loaded `mod-multibot-bridge`.
+
+<!-- DOC_SYNC_2026_09_26_GLOBAL_CHAT_AUDIT_V2 -->
+# 26 September 2026 — Structured Closeout Baseline
+
+The current branch includes the specialized `GLYPH_EQUIP_V1`, `BOT_WIPE_V1`, `BOT_SUMMON_V1` and `BOT_RELEASE_V1` paths. They remain bounded server-side operations and do not expose a generic Playerbots command executor.
+
+The companion addon now converts recognized Quest feedback from controlled bots into localized local system feedback. Client-side whisper suppression requires positive bot identity from the current Bridge roster, so matching text from a human sender is not sufficient for suppression.
+
+Warlock Firestone/Spellstone remains closed through `WARLOCK_STONE_STATE_V1`. The next project milestone is the read-only `audit-multibot-global-remaining-chat-paths-v2`, followed by evidence-based final legacy parser/fallback cleanup.
+
+`mod-playerbots` remains strictly read-only.
