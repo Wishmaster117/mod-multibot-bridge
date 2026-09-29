@@ -246,6 +246,7 @@ char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kLootRuleItemCapability = "LOOT_RULE_ITEM_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
+char const* const kQuestAbandonTargetCapability = "QUEST_ABANDON_TARGET_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
 char const* const kTalentSpecApplyCapability = "TALENT_SPEC_APPLY_V1";
 char const* const kGlyphEquipCapability = "GLYPH_EQUIP_V1";
@@ -345,6 +346,7 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
 void RunTalentApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& build);
 void RunTalentSpecApplyCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 slot, uint32 specIndex);
 void RunQuestAbandonCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, uint32 questId);
+void RunQuestAbandonTargetCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 questId);
 void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void RunFollowOrderCommand(Player* requester, ChatMsg replyType, std::string const& requestToken);
@@ -424,6 +426,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kInventoryOpenCapability,
         kLootRuleItemCapability,
         kQuestAbandonCapability,
+        kQuestAbandonTargetCapability,
         kTalentApplyCapability,
         kTalentSpecApplyCapability,
         kGlyphEquipCapability,
@@ -7432,6 +7435,100 @@ void RunQuestAbandonCommand(
     SendAddonPacket(requester, replyType, "QUEST_ABANDON_RESULT", payload.str());
 }
 // MB_QUEST_ABANDON_V1_END
+// MB_QUEST_ABANDON_TARGET_V1_BEGIN
+void RunQuestAbandonTargetCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& botNameValue,
+    std::string const& requestToken,
+    uint32 questId)
+{
+    std::string const token = Trim(requestToken);
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string effectiveBotName = requestedBotName;
+    std::string reason = "OK";
+    uint32 abandoned = 0;
+
+    if (!requester || !requester->GetSession() ||
+        !requester->IsInWorld() || requestedBotName.empty() || !questId)
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (!ConsumeQuestAbandonRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else if (!RegisterQuestAbandonToken(requester, token))
+    {
+        reason = "DUPLICATE";
+    }
+    else
+    {
+        Player* const bot = FindBotByName(requester, requestedBotName);
+        if (!bot)
+        {
+            reason = "NO_BOT";
+        }
+        else
+        {
+            effectiveBotName = bot->GetName();
+            PlayerbotAI* const botAI = GetBotAI(bot);
+
+            if (!botAI || !botAI->GetSecurity() ||
+                !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+            {
+                reason = "FORBIDDEN";
+            }
+            else if (!bot->GetSession() || !bot->IsInWorld())
+            {
+                reason = "NOT_READY";
+            }
+            else
+            {
+                uint8 questSlot = MAX_QUEST_LOG_SIZE;
+                for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                {
+                    if (bot->GetQuestSlotQuestId(slot) == questId)
+                    {
+                        questSlot = slot;
+                        break;
+                    }
+                }
+
+                if (questSlot >= MAX_QUEST_LOG_SIZE)
+                {
+                    reason = "NO_QUEST";
+                }
+                else
+                {
+                    WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST, 1);
+                    packet << questSlot;
+
+                    WorldPackets::Quest::QuestLogRemoveQuest removeQuestPacket(std::move(packet));
+                    removeQuestPacket.Read();
+                    bot->GetSession()->HandleQuestLogRemoveQuest(removeQuestPacket);
+
+                    if (bot->GetQuestSlotQuestId(questSlot) != questId)
+                        abandoned = 1;
+                    else
+                        reason = "FAILED";
+                }
+            }
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << questId
+        << kFieldSeparator << status
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << abandoned;
+
+    SendAddonPacket(requester, replyType, "QUEST_ABANDON_TARGET_RESULT", payload.str());
+}
+// MB_QUEST_ABANDON_TARGET_V1_END
 struct GroupRollRateState
 {
     std::deque<std::chrono::steady_clock::time_point> requests;
@@ -20301,6 +20398,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
 
         RunQuestAbandonCommand(player, replyType, fields[1], questId);
+        return true;
+    }
+    if (requestType == "QUEST_ABANDON_TARGET")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string botName;
+        if (!TryUrlDecodeField(fields[2], botName, kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT");
+
+        uint32 questId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), questId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunQuestAbandonTargetCommand(player, replyType, botName, fields[1], questId);
         return true;
     }
     if (requestType == "GROUP_ROLL")
