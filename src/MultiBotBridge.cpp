@@ -273,6 +273,7 @@ char const* const kHunterPetManageCapability = "HUNTER_PET_MANAGE_V1";
 char const* const kHunterPetLifecycleCapability = "HUNTER_PET_LIFECYCLE_V1";
 std::unordered_set<std::string> gHunterPetDismissedStrategyRestore;
 char const* const kFleeOrderCapability = "FLEE_ORDER_V1";
+char const* const kBotResetCapability = "BOT_RESET_V1";
 char const* const kGroupActionCapability = "GROUP_ACTION_V1";
 char const* const kFormationCapability = "FORMATION_V1";
 char const* const kRtscOrderCapability = "RTSC_ORDER_V1";
@@ -450,6 +451,7 @@ kHunterPetControlCapability,
 kHunterPetManageCapability,
 kHunterPetLifecycleCapability,
 kFleeOrderCapability,
+kBotResetCapability,
 kGroupActionCapability,
 kFormationCapability,
 kRtscOrderCapability,
@@ -18627,6 +18629,203 @@ void RunBotTargetResolveRequest(
 // MB_BOT_TARGET_RESOLVE_V1_END
 // MB_BOT_LIFECYCLE_V1_END
 
+// MB_BOT_RESET_V1_BEGIN
+bool ApplyNativeBotReset(Player* requester, Player* bot, std::string const& operation)
+{
+    if (!requester || !bot || !requester->GetSession() || !bot->GetSession() ||
+        !requester->IsInWorld() || !bot->IsInWorld())
+    {
+        return false;
+    }
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return false;
+    }
+
+    if (operation == "ACTIONS")
+    {
+        botAI->Reset(true);
+        return true;
+    }
+
+    if (operation == "AI")
+    {
+        SetPlayerbotFeedbackRoute(botAI, requester, true);
+        bool const executed = botAI->DoSpecificAction(
+            "reset botAI",
+            Event("reset botAI", "", requester),
+            true);
+        SetPlayerbotFeedbackRoute(botAI, requester, false);
+        return executed;
+    }
+
+    return false;
+}
+
+// MB_BOT_RESET_ITEM_V1_BEGIN
+bool SendBotResetItem(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& operation,
+    std::string const& botName,
+    bool applied)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << operation
+        << kFieldSeparator << UrlEncodeField(botName)
+        << kFieldSeparator << (applied ? "OK" : "ERR");
+
+    return SendStateAddonPacket(requester, replyType, "BOT_RESET_ITEM", payload.str());
+}
+// MB_BOT_RESET_ITEM_V1_END
+
+void SendBotResetAck(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& scope,
+    std::string const& operation,
+    uint32 matched,
+    uint32 succeeded,
+    uint32 failed,
+    std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << requestToken
+        << kFieldSeparator << scope
+        << kFieldSeparator << operation
+        << kFieldSeparator << matched
+        << kFieldSeparator << succeeded
+        << kFieldSeparator << failed
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "BOT_RESET_ACK", payload.str());
+}
+
+void RunBotResetCommand(
+    Player* requester,
+    ChatMsg replyType,
+    std::string const& requestToken,
+    std::string const& scope,
+    std::string const& operation,
+    std::string const& targetName)
+{
+    if (scope == "TARGET")
+    {
+        PlayerbotMgr* const mgr = requester ? sPlayerbotsMgr.GetPlayerbotMgr(requester) : nullptr;
+        if (!mgr)
+        {
+            SendBotResetAck(
+                requester, replyType, requestToken, scope, operation, 0, 0, 0, "FAILED");
+            return;
+        }
+
+        ObjectGuid targetGuid;
+        CharacterCacheEntry const* target = nullptr;
+        if (!ResolveBotLifecycleTargetByName(requester, targetName, targetGuid, target))
+        {
+            SendBotResetAck(
+                requester, replyType, requestToken, scope, operation, 0, 0, 0, "NOT_ALLOWED");
+            return;
+        }
+
+        Player* const bot = mgr->GetPlayerBot(targetGuid);
+        if (!bot)
+        {
+            SendBotResetAck(
+                requester, replyType, requestToken, scope, operation, 0, 0, 0, "NOT_CONTROLLED");
+            return;
+        }
+
+        bool const applied = ApplyNativeBotReset(requester, bot, operation);
+        SendBotResetItem(
+            requester,
+            replyType,
+            requestToken,
+            operation,
+            bot->GetName(),
+            applied);
+        SendBotResetAck(
+            requester,
+            replyType,
+            requestToken,
+            scope,
+            operation,
+            1,
+            applied ? 1 : 0,
+            applied ? 0 : 1,
+            applied ? "OK" : "FAILED");
+        return;
+    }
+
+    Group* const requesterGroup = requester ? requester->GetGroup() : nullptr;
+    if (!requesterGroup)
+    {
+        SendBotResetAck(
+            requester, replyType, requestToken, scope, operation, 0, 0, 0, "NO_GROUP");
+        return;
+    }
+
+    uint32 matched = 0;
+    uint32 succeeded = 0;
+    uint32 failed = 0;
+    bool botLimitExceeded = false;
+
+    for (Player* const bot : GetBridgeVisibleBots(requester))
+    {
+        if (!bot || bot->GetGroup() != requesterGroup)
+            continue;
+
+        if (matched >= kGroupOrderMaxMatchedBots)
+        {
+            botLimitExceeded = true;
+            break;
+        }
+
+        ++matched;
+        bool const applied = ApplyNativeBotReset(requester, bot, operation);
+        if (applied)
+            ++succeeded;
+        else
+            ++failed;
+
+        SendBotResetItem(
+            requester,
+            replyType,
+            requestToken,
+            operation,
+            bot->GetName(),
+            applied);
+    }
+
+    std::string reason = "OK";
+    if (botLimitExceeded)
+        reason = "BOT_LIMIT";
+    else if (matched == 0)
+        reason = "NO_BOTS";
+    else if (failed > 0 && succeeded > 0)
+        reason = "PARTIAL";
+    else if (failed > 0)
+        reason = "FAILED";
+
+    SendBotResetAck(
+        requester,
+        replyType,
+        requestToken,
+        scope,
+        operation,
+        matched,
+        succeeded,
+        failed,
+        reason);
+}
+// MB_BOT_RESET_V1_END
+
 // MB_FLEE_ORDER_V1_BEGIN
 bool ApplyNativeFleeOrder(Player* requester, Player* bot)
 {
@@ -20020,6 +20219,62 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         return true;
     }
+    if (requestType == "BOT_RESET")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() != 5)
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const scope = ToUpper(Trim(fields[2]));
+        if (fields[2] != scope || (scope != "TARGET" && scope != "GROUP"))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_SCOPE");
+
+        std::string const operation = ToUpper(Trim(fields[3]));
+        if (fields[3] != operation || (operation != "ACTIONS" && operation != "AI"))
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_OPERATION");
+
+        std::string targetName;
+        if (scope == "TARGET")
+        {
+            if (!TryUrlDecodeField(fields[4], targetName, kMaxBotNameLength, false) ||
+                targetName != Trim(targetName))
+            {
+                return SendProtocolError(
+                    player, replyType, normalized, requestType, token, "BAD_TARGET");
+            }
+        }
+        else if (!fields[4].empty())
+        {
+            return SendProtocolError(
+                player, replyType, normalized, requestType, token, "BAD_TARGET");
+        }
+
+        if (!ConsumeGroupOrderRateLimit(player))
+        {
+            SendBotResetAck(
+                player, replyType, fields[1], scope, operation, 0, 0, 0, "RATE_LIMIT");
+            return true;
+        }
+
+        if (!RegisterGroupOrderToken(player, fields[1]))
+        {
+            SendBotResetAck(
+                player, replyType, fields[1], scope, operation, 0, 0, 0, "REPLAY");
+            return true;
+        }
+
+        RunBotResetCommand(
+            player, replyType, fields[1], scope, operation, targetName);
+        return true;
+    }
+
     if (requestType == "FLEE_ORDER")
     {
         std::string const token = GetSafeErrorToken(fields, 1);
