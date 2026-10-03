@@ -566,6 +566,38 @@ The current branch includes the specialized `GLYPH_EQUIP_V1`, `BOT_WIPE_V1`, `BO
 
 The companion addon now converts recognized Quest feedback from controlled bots into localized local system feedback. Client-side whisper suppression requires positive bot identity from the current Bridge roster, so matching text from a human sender is not sufficient for suppression.
 
-Warlock Firestone/Spellstone remains closed through `WARLOCK_STONE_STATE_V1`. The next project milestone is the read-only `audit-multibot-global-remaining-chat-paths-v2`, followed by evidence-based final legacy parser/fallback cleanup.
+Warlock Firestone/Spellstone remains closed through `WARLOCK_STONE_STATE_V1`. The global remaining-chat audit and its follow-up cleanup have since progressed beyond this 26 September snapshot; the current state is summarized below.
 
 `mod-playerbots` remains strictly read-only.
+
+<!-- DOC_SYNC_2026_10_03_GLOBAL_CHAT_CLEANUP_G4 -->
+# 3 October 2026 — Global Chat Cleanup Progress
+
+The global cleanup has moved several technical automatic chat dependencies out of the normal addon path while preserving intentional manual Playerbots commands.
+
+Protected manual commands remain intentionally available through normal chat, including `who`, `co ?`, `nc ?` and `ss ?`. Automatic technical equivalents used internally by the addon are migrated or removed independently and must not be confused with those manual commands.
+
+Recent closeouts include:
+
+- automatic strategy/state refresh callsites for `co ?`, `nc ?` and `ss ?` removed or replaced where structured state already exists;
+- Quest-list refresh and PvP statistics moved away from their legacy automatic chat dependencies;
+- the obsolete peer-whisper Stats protocol removed after its modern Bridge-backed replacement was proven active;
+- the generic Inventory instant-action WHISPER fallback removed after all three remaining callers were proven to route through structured Inventory actions.
+
+The native Playerbots Trade workflow still emits an `=== Inventory ===` whisper dump when a trade begins. The companion addon therefore retains a narrow client-side Trade-dump compatibility filter. G4f2 removed an incorrect dependency on `MultiBot.bridge.connected` from explicit filter arming and runtime validation confirmed that chat spam disappeared.
+
+A later attempt to remove the unarmed `tradePartner` / `autoDetected` fallback caused the Trade inventory spam to return immediately. That change was rolled back and the no-spam runtime state was restored.
+
+**Do not remove or simplify that Trade-dump fallback again without runtime instrumentation that demonstrates precisely why the explicitly armed state is insufficient and proves the replacement under real Trade timing.**
+
+This filter is a targeted compatibility shim for native Playerbots Trade feedback; it is not the generic `allowLegacyChatFallback` command transport.
+
+Current audited source baseline on 3 October 2026:
+
+```text
+Addon HEAD:      c6dbaf2853460e66a44960dad96d9e836e2ffc30
+Bridge HEAD:     868c1e85b11cd883e02c285459a894a76da7f581
+Playerbots HEAD: 037c01418b5d01506917a3db9b44fd56ac5f965c
+```
+
+`mod-playerbots` remains strictly read-only. The next work resumes the remaining automatic chat-path audit/cleanup; the external Beast Master module migration stays deferred until the very end of the main cleanup.
