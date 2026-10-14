@@ -12800,6 +12800,17 @@ bool ResolveRogueDpsStrategyAlias(
     return !resolvedChanges.empty() && resolvedChanges.size() <= kMaxCommandLength;
 }
 
+// aliases like warrior "tank" are stored under the strategy's own name ("prot")
+std::string ResolveStrategyName(PlayerbotAI* botAI, BotState botState, std::string const& name)
+{
+    if (botAI->HasStrategy(name, botState))
+        return name;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    Strategy* const strategy = context ? context->GetStrategy(name) : nullptr;
+    return strategy ? strategy->getName() : name;
+}
+
 bool VerifyStrategyMutationResult(
     PlayerbotAI* botAI,
     BotState botState,
@@ -12811,10 +12822,11 @@ bool VerifyStrategyMutationResult(
     std::set<std::string> verifiedStrategies;
     for (auto operation = operations.rbegin(); operation != operations.rend(); ++operation)
     {
-        if (!verifiedStrategies.insert(operation->name).second)
+        std::string const name = ResolveStrategyName(botAI, botState, operation->name);
+        if (!verifiedStrategies.insert(name).second)
             continue;
 
-        if (botAI->HasStrategy(operation->name, botState) != operation->enable)
+        if (botAI->HasStrategy(name, botState) != operation->enable)
             return false;
     }
 
