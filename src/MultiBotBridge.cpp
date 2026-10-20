@@ -51,6 +51,7 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <atomic>
 #include <random>
 #include <unordered_set>
 #include <array>
@@ -20191,6 +20192,16 @@ struct EquipPendingBot
     std::chrono::steady_clock::time_point touchedAt = {};
 };
 std::map<std::pair<uint32, uint32>, EquipPendingBot> sEquipPendingBots;
+// A lock-free empty-queue fast path for the high-frequency PlayerScript update.
+// Synchronize the hint on *every* queue mutation while the queue mutex is held.
+std::atomic<bool> sEquipHasPendingEvents{false};
+struct EquipPendingFlagSync
+{
+    ~EquipPendingFlagSync()
+    {
+        sEquipHasPendingEvents.store(!sEquipPendingBots.empty(), std::memory_order_release);
+    }
+};
 std::map<uint32, std::chrono::steady_clock::time_point> sEquipLastFlush;
 constexpr std::size_t kEquipMaxPendingBotPairs = 256;
 constexpr std::size_t kEquipMaxPacketsPerFlush = 6;
@@ -20266,6 +20277,7 @@ void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
 
     auto const now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    EquipPendingFlagSync const pendingSync;
     auto baseline = sEquipEventBaselines.find(key);
     if (baseline == sEquipEventBaselines.end() || baseline->second.mapId != mapId)
         return;
@@ -20329,6 +20341,9 @@ void FlushEquipEvents(Player* master)
     if (!master || !master->GetSession() || !master->IsInWorld() || master->IsBeingTeleported())
         return;
 
+    if (!sEquipHasPendingEvents.load(std::memory_order_acquire))
+        return;
+
     uint32 const ownerId = master->GetGUID().GetCounter();
     auto const now = std::chrono::steady_clock::now();
     std::vector<EquipSelectedEvent> selected;
@@ -20339,10 +20354,12 @@ void FlushEquipEvents(Player* master)
         auto last = sEquipLastFlush.find(ownerId);
         if (last != sEquipLastFlush.end() && now - last->second < kEquipFlushInterval)
             return;
-        for (auto const& entry : sEquipPendingBots)
+        // The queue is ordered by (owner, bot): only inspect this owner's entries.
+        for (auto it = sEquipPendingBots.lower_bound({ownerId, 0});
+             it != sEquipPendingBots.end() && it->first.first == ownerId; ++it)
         {
-            if (entry.first.first != ownerId ||
-                now - entry.second.firstQueued < kEquipFlushInterval)
+            auto const& entry = *it;
+            if (now - entry.second.firstQueued < kEquipFlushInterval)
                 continue;
             for (auto const& change : entry.second.slots)
             {
@@ -20390,6 +20407,7 @@ void FlushEquipEvents(Player* master)
             !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
         {
             std::lock_guard<std::mutex> guard(sEquipEventMutex);
+            EquipPendingFlagSync const pendingSync;
             sEquipPendingBots.erase(event.key);
             sEquipEventBaselines.erase(event.key);
             continue;
@@ -20404,6 +20422,7 @@ void FlushEquipEvents(Player* master)
         // Only now advance the baseline. If a newer callback arrived during
         // the send, retain that pending slot with the just-sent item as its old.
         std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        EquipPendingFlagSync const pendingSync;
         auto pending = sEquipPendingBots.find(event.key);
         if (pending == sEquipPendingBots.end() || pending->second.mapId != event.mapId)
             continue;
@@ -20435,6 +20454,7 @@ void ClearEquipEventState(Player* player)
         return;
     uint32 const id = player->GetGUID().GetCounter();
     std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    EquipPendingFlagSync const pendingSync;
     for (auto it = sEquipPendingBots.begin(); it != sEquipPendingBots.end();)
     {
         if (it->first.first == id || it->first.second == id)
