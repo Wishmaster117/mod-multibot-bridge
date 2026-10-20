@@ -20530,10 +20530,17 @@ void FlushEquipEvents(Player* master)
                 break;
             }
         }
-        // A bot on another map/instance cannot be safely inspected here.
-        // Leave the event pending for a subsequent local update or lifecycle cleanup.
+        // The bot is not on the owner's map instance: drop its obsolete pair.
+        // Keeping it would repeatedly occupy the first six flush slots and
+        // starve reachable bots. Map changes rebuild the equipment baseline.
         if (!bot)
+        {
+            std::lock_guard<std::mutex> guard(sEquipEventMutex);
+            EquipPendingFlagSync const pendingSync;
+            sEquipPendingBots.erase(event.key);
+            sEquipEventBaselines.erase(event.key);
             continue;
+        }
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
         if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
             bot->GetMapId() != event.mapId || !botAI ||
