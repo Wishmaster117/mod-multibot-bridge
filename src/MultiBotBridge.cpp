@@ -15,6 +15,7 @@
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -51,6 +52,7 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <random>
 #include <unordered_set>
@@ -73,6 +75,16 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 // mod-playerbots #2854 renamed PlayerbotAIConfig members; support old and new headers.
 // Once all supported Playerbots versions have the new names, this compatibility layer can be removed.
@@ -730,6 +742,133 @@ std::string SanitizeLogValue(std::string const& value, std::size_t maxLength)
 }
 
 // MB_BRIDGE_FILELOGS_V1_BEGIN
+// Log file handles must never resolve through an attacker-replaced symbolic link.
+// Native open + no-follow flag + descriptor validation avoid check/open races.
+class SecureBridgeLogOutput
+{
+public:
+    ~SecureBridgeLogOutput() { Close(); }
+    SecureBridgeLogOutput(SecureBridgeLogOutput const&) = delete;
+    SecureBridgeLogOutput& operator=(SecureBridgeLogOutput const&) = delete;
+    SecureBridgeLogOutput() = default;
+
+    bool Open(std::filesystem::path const& path, bool truncate)
+    {
+        Close();
+#ifdef _WIN32
+        // Open an existing object without following its reparse point, or create
+        // a new object atomically. Never use CREATE_ALWAYS before validation.
+        HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE && ::GetLastError() == ERROR_FILE_NOT_FOUND)
+            file = ::CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        BY_HANDLE_FILE_INFORMATION information{};
+        LARGE_INTEGER size{};
+        if (!::GetFileInformationByHandle(file, &information) ||
+            (information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+            !::GetFileSizeEx(file, &size) || size.QuadPart < 0)
+        {
+            ::CloseHandle(file);
+            return false;
+        }
+        if (truncate)
+        {
+            LARGE_INTEGER zero{};
+            if (!::SetFilePointerEx(file, zero, nullptr, FILE_BEGIN) || !::SetEndOfFile(file))
+            {
+                ::CloseHandle(file);
+                return false;
+            }
+        }
+        handle_ = file;
+        size_ = truncate ? 0 : static_cast<std::uintmax_t>(size.QuadPart);
+#else
+        int const fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+        if (fd < 0)
+            return false;
+        struct stat information{};
+        if (::fstat(fd, &information) != 0 || !S_ISREG(information.st_mode) || information.st_size < 0 ||
+            (truncate && ::ftruncate(fd, 0) != 0))
+        {
+            ::close(fd);
+            return false;
+        }
+        fd_ = fd;
+        size_ = truncate ? 0 : static_cast<std::uintmax_t>(information.st_size);
+#endif
+        return true;
+    }
+
+    std::uintmax_t Size() const { return size_; }
+
+    bool Flush()
+    {
+#ifdef _WIN32
+        return handle_ != INVALID_HANDLE_VALUE; // WriteFile already sends data to the OS.
+#else
+        return fd_ >= 0; // write() has no userspace stream buffer to flush.
+#endif
+    }
+
+    bool Write(std::string const& data)
+    {
+#ifdef _WIN32
+        if (handle_ == INVALID_HANDLE_VALUE || data.size() > std::numeric_limits<DWORD>::max())
+            return false;
+        LARGE_INTEGER zero{};
+        DWORD written = 0;
+        if (!::SetFilePointerEx(handle_, zero, nullptr, FILE_END) ||
+            !::WriteFile(handle_, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) ||
+            written != data.size())
+            return false;
+#else
+        if (fd_ < 0)
+            return false;
+        std::size_t done = 0;
+        while (done < data.size())
+        {
+            ssize_t const written = ::write(fd_, data.data() + done, data.size() - done);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                return false;
+            done += static_cast<std::size_t>(written);
+        }
+#endif
+        size_ += data.size();
+        return Flush();
+    }
+
+    void Close()
+    {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+        size_ = 0;
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+    std::uintmax_t size_ = 0;
+};
+
 // Diagnostic traffic only. All filesystem writes stay inside the configured LogsDir.
 // When disabled (the default), no file is opened or created.
 void WriteBridgeFileLog(std::string const& message)
@@ -740,7 +879,7 @@ void WriteBridgeFileLog(std::string const& message)
     constexpr std::uintmax_t maxFileBytes = 16u * 1024u * 1024u;
     constexpr int rotatedFiles = 3;
     static std::mutex logMutex;
-    static std::ofstream output;
+    static SecureBridgeLogOutput output;
     static std::uintmax_t fileBytes = 0;
     static bool initialized = false;
     static bool disabledAfterError = false;
@@ -767,33 +906,14 @@ void WriteBridgeFileLog(std::string const& message)
             return;
         }
 
-        bool const exists = std::filesystem::exists(logPath, ec);
-        if (ec)
+        // Open is race-safe: it rejects a symlink/reparse point on the final
+        // file name using the actual opened descriptor/handle.
+        if (!output.Open(logPath, false))
         {
-            fail("cannot inspect log file");
+            fail("cannot securely open log file");
             return;
         }
-        if (exists)
-        {
-            if (!std::filesystem::is_regular_file(logPath, ec) || ec)
-            {
-                fail("log path is not a regular file");
-                return;
-            }
-            fileBytes = std::filesystem::file_size(logPath, ec);
-            if (ec)
-            {
-                fail("cannot read log file size");
-                return;
-            }
-        }
-
-        output.open(logPath, std::ios::binary | std::ios::out | std::ios::app);
-        if (!output.is_open())
-        {
-            fail("cannot open log file");
-            return;
-        }
+        fileBytes = output.Size();
         initialized = true;
     }
 
@@ -818,8 +938,12 @@ void WriteBridgeFileLog(std::string const& message)
 
     if (fileBytes + line.size() > maxFileBytes)
     {
-        output.flush();
-        output.close();
+        if (!output.Flush())
+        {
+            fail("cannot flush log file for rotation");
+            return;
+        }
+        output.Close();
         for (int i = rotatedFiles; i >= 1; --i)
         {
             std::filesystem::path from = logPath;
@@ -837,6 +961,11 @@ void WriteBridgeFileLog(std::string const& message)
             }
             if (!fromExists)
                 continue;
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(from, ec)) || ec)
+            {
+                fail("rotated log source is a symlink or cannot be inspected");
+                return;
+            }
             if (std::filesystem::exists(to, ec))
                 std::filesystem::remove(to, ec);
             if (ec)
@@ -851,19 +980,15 @@ void WriteBridgeFileLog(std::string const& message)
                 return;
             }
         }
-        output.clear();
-        output.open(logPath, std::ios::binary | std::ios::out | std::ios::trunc);
-        if (!output.is_open())
+        if (!output.Open(logPath, true))
         {
-            fail("cannot reopen log file after rotation");
+            fail("cannot securely reopen log file after rotation");
             return;
         }
         fileBytes = 0;
     }
 
-    output.write(line.data(), static_cast<std::streamsize>(line.size()));
-    output.flush();
-    if (!output.good())
+    if (!output.Write(line))
     {
         fail("cannot write log file");
         return;
@@ -20387,20 +20512,29 @@ void FlushEquipEvents(Player* master)
             sEquipLastFlush[ownerId] = now;
     }
 
-    // Resolve bot pointers only within this update, never store them in the queue.
-    std::vector<Player*> const visibleBots = GetBridgeVisibleBots(master);
+    // Only dereference Players belonging to the master's own Map instance.
+    // GetBridgeVisibleBots may return Players updated by a different map thread.
+    // Iterate the map-local references instead; do not retain their pointers.
+    Map const* const ownerMap = master->GetMap();
+    if (!ownerMap)
+        return;
     for (EquipSelectedEvent const& event : selected)
     {
         Player* bot = nullptr;
-        for (Player* const candidate : visibleBots)
+        for (auto const& reference : ownerMap->GetPlayers())
         {
+            Player* const candidate = reference.GetSource();
             if (candidate && candidate->GetGUID().GetCounter() == event.key.second)
             {
                 bot = candidate;
                 break;
             }
         }
-        PlayerbotAI* const botAI = bot ? sPlayerbotsMgr.GetPlayerbotAI(bot) : nullptr;
+        // A bot on another map/instance cannot be safely inspected here.
+        // Leave the event pending for a subsequent local update or lifecycle cleanup.
+        if (!bot)
+            continue;
+        PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
         if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
             bot->GetMapId() != event.mapId || !botAI ||
             !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
