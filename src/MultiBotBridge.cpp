@@ -758,7 +758,9 @@ void WriteBridgeFileLog(std::string const& message)
     if (!initialized)
     {
         std::error_code ec;
-        if (!std::filesystem::is_directory(logPath.parent_path(), ec) || ec)
+        std::filesystem::path const logDirectory = logPath.has_parent_path()
+            ? logPath.parent_path() : std::filesystem::path(".");
+        if (!std::filesystem::is_directory(logDirectory, ec) || ec)
         {
             fail("configured log directory is missing or inaccessible");
             return;
@@ -20180,7 +20182,7 @@ void PrimeEquipEventBaseline(Player* requester, Player* bot)
 {
     if (!requester || !bot || !requester->GetSession() || !requester->IsInWorld() ||
         !bot->IsInWorld() || bot->IsBeingTeleported() ||
-        !IsBotInRequesterGroup(requester, bot) || !IsBotMasteredByRequester(requester, bot))
+        !IsBotMasteredByRequester(requester, bot))
         return;
 
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
@@ -20219,7 +20221,7 @@ void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
     Player* const master = botAI ? botAI->GetMaster() : nullptr;
     if (!master || master == bot || !master->GetSession() || !master->IsInWorld() ||
-        master->IsBeingTeleported() || !IsBotInRequesterGroup(master, bot) ||
+        master->IsBeingTeleported() ||
         !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
         !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
         return;
