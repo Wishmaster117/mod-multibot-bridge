@@ -20173,10 +20173,29 @@ void ObserveBotEquipment(Player* requester, ChatMsg replyType,
     SendEquipObserveDone(requester, replyType, encodedName, token, "OK");
 }
 // MB_R7_EVENT_EQUIP_V1_BEGIN
-// Called only for a requested roster or an actual equipment change.
-// The existing snapshot map stores IDs, never Player/Item pointers.
+// R8: events are coalesced per owner/bot/slot, then sent from the owner's
+// normal PlayerScript update. No Player/Item pointer survives the callback.
 std::map<std::pair<uint32, uint32>, EquipObserveBotState> sEquipEventBaselines;
 std::mutex sEquipEventMutex;
+
+struct EquipPendingSlot
+{
+    EquipObserveItemState oldItem;
+    EquipObserveItemState newItem;
+};
+struct EquipPendingBot
+{
+    uint32 mapId = 0;
+    std::map<uint8, EquipPendingSlot> slots;
+    std::chrono::steady_clock::time_point firstQueued = {};
+    std::chrono::steady_clock::time_point touchedAt = {};
+};
+std::map<std::pair<uint32, uint32>, EquipPendingBot> sEquipPendingBots;
+std::map<uint32, std::chrono::steady_clock::time_point> sEquipLastFlush;
+constexpr std::size_t kEquipMaxPendingBotPairs = 256;
+constexpr std::size_t kEquipMaxPacketsPerFlush = 6;
+constexpr std::chrono::milliseconds kEquipFlushInterval(150);
+constexpr std::chrono::seconds kEquipPendingTtl(60);
 
 void PrimeEquipEventBaseline(Player* requester, Player* bot)
 {
@@ -20226,39 +20245,211 @@ void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
         !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
         return;
 
-    uint32 const newId = item ? item->GetEntry() : 0;
-    uint64 const newGuid = item ? static_cast<uint64>(item->GetGUID().GetCounter()) : 0;
-    uint32 oldId = 0;
-    bool needBaseline = false;
+    EquipObserveItemState const newItem = {
+        item ? static_cast<uint64>(item->GetGUID().GetCounter()) : 0,
+        item ? item->GetEntry() : 0
+    };
     auto const key = std::make_pair(master->GetGUID().GetCounter(), bot->GetGUID().GetCounter());
+    uint32 const mapId = bot->GetMapId();
+    bool hasBaseline = false;
     {
         std::lock_guard<std::mutex> guard(sEquipEventMutex);
         auto existing = sEquipEventBaselines.find(key);
-        if (existing != sEquipEventBaselines.end() && existing->second.mapId == bot->GetMapId())
-        {
-            EquipObserveItemState& old = existing->second.slots[slot];
-            oldId = old.itemId;
-            if (old.itemId == newId && old.guidCounter == newGuid)
-                return;
-            old.itemId = newId;
-            old.guidCounter = newGuid;
-            existing->second.seenAt = std::chrono::steady_clock::now();
-        }
-        else
-            needBaseline = true;
+        hasBaseline = existing != sEquipEventBaselines.end() && existing->second.mapId == mapId;
     }
-    if (needBaseline)
+    if (!hasBaseline)
     {
-        // First event after joining or reconnecting: the old ID may be unknown.
-        // Still notify so the visible inventory can refresh.
+        // As before: read the full snapshot on the first event. Because it
+        // already contains the changed item, its previous ID is unknown.
         PrimeEquipEventBaseline(master, bot);
     }
 
-    std::ostringstream payload;
-    payload << UrlEncodeField(bot->GetName()) << kFieldSeparator
-            << static_cast<uint32>(slot) << kFieldSeparator << oldId
-            << kFieldSeparator << newId;
-    SendStateAddonPacket(master, CHAT_MSG_WHISPER, "EQUIP_CHANGED", payload.str());
+    auto const now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    auto baseline = sEquipEventBaselines.find(key);
+    if (baseline == sEquipEventBaselines.end() || baseline->second.mapId != mapId)
+        return;
+    EquipObserveItemState const oldItem = hasBaseline ? baseline->second.slots[slot] : EquipObserveItemState{};
+    auto pending = sEquipPendingBots.find(key);
+    if (pending != sEquipPendingBots.end() && pending->second.mapId != mapId)
+    {
+        sEquipPendingBots.erase(pending);
+        pending = sEquipPendingBots.end();
+    }
+    if (pending == sEquipPendingBots.end() &&
+        oldItem.itemId == newItem.itemId && oldItem.guidCounter == newItem.guidCounter)
+        return;
+
+    if (pending == sEquipPendingBots.end())
+    {
+        if (sEquipPendingBots.size() >= kEquipMaxPendingBotPairs)
+        {
+            for (auto it = sEquipPendingBots.begin(); it != sEquipPendingBots.end();)
+            {
+                if (now - it->second.touchedAt >= kEquipPendingTtl)
+                    it = sEquipPendingBots.erase(it);
+                else
+                    ++it;
+            }
+        }
+        // Do not grow the queue without a bound. An exceptional over-capacity
+        // event can be resynchronized through the next requested roster.
+        if (sEquipPendingBots.size() >= kEquipMaxPendingBotPairs)
+            return;
+        pending = sEquipPendingBots.emplace(key, EquipPendingBot{}).first;
+        pending->second.mapId = mapId;
+        pending->second.firstQueued = now;
+    }
+    EquipPendingBot& state = pending->second;
+    state.touchedAt = now;
+    auto change = state.slots.find(slot);
+    if (change == state.slots.end())
+        change = state.slots.emplace(slot, EquipPendingSlot{oldItem, newItem}).first;
+    else
+        change->second.newItem = newItem;
+
+    if (change->second.oldItem.itemId == newItem.itemId &&
+        change->second.oldItem.guidCounter == newItem.guidCounter)
+        state.slots.erase(change); // E.g. A -> B -> A before the flush.
+    if (state.slots.empty())
+        sEquipPendingBots.erase(pending);
+}
+
+struct EquipSelectedEvent
+{
+    std::pair<uint32, uint32> key;
+    uint32 mapId = 0;
+    uint8 slot = 0;
+    EquipObserveItemState newItem;
+    uint32 oldId = 0;
+};
+
+void FlushEquipEvents(Player* master)
+{
+    if (!master || !master->GetSession() || !master->IsInWorld() || master->IsBeingTeleported())
+        return;
+
+    uint32 const ownerId = master->GetGUID().GetCounter();
+    auto const now = std::chrono::steady_clock::now();
+    std::vector<EquipSelectedEvent> selected;
+    {
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        if (sEquipPendingBots.empty())
+            return;
+        auto last = sEquipLastFlush.find(ownerId);
+        if (last != sEquipLastFlush.end() && now - last->second < kEquipFlushInterval)
+            return;
+        for (auto const& entry : sEquipPendingBots)
+        {
+            if (entry.first.first != ownerId ||
+                now - entry.second.firstQueued < kEquipFlushInterval)
+                continue;
+            for (auto const& change : entry.second.slots)
+            {
+                selected.push_back({entry.first, entry.second.mapId, change.first,
+                    change.second.newItem, change.second.oldItem.itemId});
+                if (selected.size() >= kEquipMaxPacketsPerFlush)
+                    break;
+            }
+            if (selected.size() >= kEquipMaxPacketsPerFlush)
+                break;
+        }
+        if (selected.empty())
+            return;
+        if (sEquipLastFlush.size() >= 512)
+        {
+            for (auto it = sEquipLastFlush.begin(); it != sEquipLastFlush.end();)
+            {
+                if (now - it->second >= kEquipPendingTtl)
+                    it = sEquipLastFlush.erase(it);
+                else
+                    ++it;
+            }
+        }
+        if (sEquipLastFlush.size() < 512 || sEquipLastFlush.count(ownerId) > 0)
+            sEquipLastFlush[ownerId] = now;
+    }
+
+    // Resolve bot pointers only within this update, never store them in the queue.
+    std::vector<Player*> const visibleBots = GetBridgeVisibleBots(master);
+    for (EquipSelectedEvent const& event : selected)
+    {
+        Player* bot = nullptr;
+        for (Player* const candidate : visibleBots)
+        {
+            if (candidate && candidate->GetGUID().GetCounter() == event.key.second)
+            {
+                bot = candidate;
+                break;
+            }
+        }
+        PlayerbotAI* const botAI = bot ? sPlayerbotsMgr.GetPlayerbotAI(bot) : nullptr;
+        if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+            bot->GetMapId() != event.mapId || !botAI ||
+            !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
+        {
+            std::lock_guard<std::mutex> guard(sEquipEventMutex);
+            sEquipPendingBots.erase(event.key);
+            sEquipEventBaselines.erase(event.key);
+            continue;
+        }
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName()) << kFieldSeparator
+                << static_cast<uint32>(event.slot) << kFieldSeparator << event.oldId
+                << kFieldSeparator << event.newItem.itemId;
+        if (!SendStateAddonPacket(master, CHAT_MSG_WHISPER, "EQUIP_CHANGED", payload.str()))
+            break; // Keep the pending change for the next owner update.
+
+        // Only now advance the baseline. If a newer callback arrived during
+        // the send, retain that pending slot with the just-sent item as its old.
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        auto pending = sEquipPendingBots.find(event.key);
+        if (pending == sEquipPendingBots.end() || pending->second.mapId != event.mapId)
+            continue;
+        auto change = pending->second.slots.find(event.slot);
+        if (change == pending->second.slots.end())
+            continue;
+        auto baseline = sEquipEventBaselines.find(event.key);
+        if (baseline != sEquipEventBaselines.end() && baseline->second.mapId == event.mapId)
+        {
+            baseline->second.slots[event.slot] = event.newItem;
+            baseline->second.seenAt = now;
+        }
+        if (change->second.newItem.itemId == event.newItem.itemId &&
+            change->second.newItem.guidCounter == event.newItem.guidCounter)
+            pending->second.slots.erase(change);
+        else
+        {
+            change->second.oldItem = event.newItem;
+            pending->second.firstQueued = now;
+        }
+        if (pending->second.slots.empty())
+            sEquipPendingBots.erase(pending);
+    }
+}
+
+void ClearEquipEventState(Player* player)
+{
+    if (!player)
+        return;
+    uint32 const id = player->GetGUID().GetCounter();
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    for (auto it = sEquipPendingBots.begin(); it != sEquipPendingBots.end();)
+    {
+        if (it->first.first == id || it->first.second == id)
+            it = sEquipPendingBots.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = sEquipEventBaselines.begin(); it != sEquipEventBaselines.end();)
+    {
+        if (it->first.first == id || it->first.second == id)
+            it = sEquipEventBaselines.erase(it);
+        else
+            ++it;
+    }
+    sEquipLastFlush.erase(id);
 }
 // MB_R7_EVENT_EQUIP_V1_END
 // MB_INVENTORY_H1B1A_EQUIP_OBSERVE_V1_END
@@ -22407,14 +22598,21 @@ public:
         NotifyEquipEvent(player, slot, item);
     }
 
+    void OnPlayerAfterUpdate(Player* player, uint32 /*p_time*/) override
+    {
+        FlushEquipEvents(player);
+    }
+
     void OnPlayerBeforeLogout(Player* player) override
     {
+        ClearEquipEventState(player);
         CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_LOGOUT", false);
     }
 
     void OnPlayerMapChanged(Player* player) override
     {
+        ClearEquipEventState(player);
         CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_MAP_CHANGED", true);
     }
