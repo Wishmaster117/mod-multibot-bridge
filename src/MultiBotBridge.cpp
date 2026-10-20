@@ -14,6 +14,7 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
+#include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -58,11 +59,17 @@
 #include <cstdlib>
 #include <chrono>
 #include <deque>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -251,6 +258,7 @@ std::size_t constexpr kMaxOutfitFrameSets = 128;
 std::size_t constexpr kMaxOutfitFramePartsPerSet = 128;
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kEquipObserveCapability = "EQUIP_OBSERVE_V1";
+char const* const kEquipEventsCapability = "EQUIP_EVENTS_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
 char const* const kInventoryItemTradeCapability = "ITEM_TRADE_V1";
@@ -340,6 +348,11 @@ enum class BridgePayloadStatus
 bool BridgeConsoleLogsEnabled()
 {
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
+}
+
+bool BridgeFileLogsEnabled()
+{
+    return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableFileLogs", false);
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
@@ -436,6 +449,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kOutfitFramingCapability,
         kInventoryCapability,
         kEquipObserveCapability,
+        kEquipEventsCapability,
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
         kInventoryItemTradeCapability,
@@ -713,6 +727,174 @@ std::string SanitizeLogValue(std::string const& value, std::size_t maxLength)
 
     return out;
 }
+
+// MB_BRIDGE_FILELOGS_V1_BEGIN
+// Diagnostic traffic only. All filesystem writes stay inside the configured LogsDir.
+// When disabled (the default), no file is opened or created.
+void WriteBridgeFileLog(std::string const& message)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    constexpr std::uintmax_t maxFileBytes = 16u * 1024u * 1024u;
+    constexpr int rotatedFiles = 3;
+    static std::mutex logMutex;
+    static std::ofstream output;
+    static std::uintmax_t fileBytes = 0;
+    static bool initialized = false;
+    static bool disabledAfterError = false;
+
+    std::lock_guard<std::mutex> const guard(logMutex);
+    if (disabledAfterError)
+        return;
+
+    auto fail = [](char const* reason)
+    {
+        disabledAfterError = true;
+        LOG_WARN("server.loading", "MultiBotBridge file logging disabled: {}", reason);
+    };
+
+    std::filesystem::path const logPath = std::filesystem::path(sLog->GetLogsDir()) / "MultiBotBridge.log";
+    if (!initialized)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(logPath.parent_path(), ec) || ec)
+        {
+            fail("configured log directory is missing or inaccessible");
+            return;
+        }
+
+        bool const exists = std::filesystem::exists(logPath, ec);
+        if (ec)
+        {
+            fail("cannot inspect log file");
+            return;
+        }
+        if (exists)
+        {
+            if (!std::filesystem::is_regular_file(logPath, ec) || ec)
+            {
+                fail("log path is not a regular file");
+                return;
+            }
+            fileBytes = std::filesystem::file_size(logPath, ec);
+            if (ec)
+            {
+                fail("cannot read log file size");
+                return;
+            }
+        }
+
+        output.open(logPath, std::ios::binary | std::ios::out | std::ios::app);
+        if (!output.is_open())
+        {
+            fail("cannot open log file");
+            return;
+        }
+        initialized = true;
+    }
+
+    auto const now = std::chrono::system_clock::now();
+    std::time_t const rawTime = std::chrono::system_clock::to_time_t(now);
+    std::tm utcTime{};
+#ifdef _WIN32
+    if (gmtime_s(&utcTime, &rawTime) != 0)
+#else
+    if (gmtime_r(&rawTime, &utcTime) == nullptr)
+#endif
+    {
+        fail("cannot convert log timestamp");
+        return;
+    }
+    auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000;
+    std::ostringstream lineStream;
+    lineStream << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%S") << '.'
+               << std::setw(3) << std::setfill('0') << millis << "Z " << message << '\n';
+    std::string const line = lineStream.str();
+
+    if (fileBytes + line.size() > maxFileBytes)
+    {
+        output.flush();
+        output.close();
+        for (int i = rotatedFiles; i >= 1; --i)
+        {
+            std::filesystem::path from = logPath;
+            if (i > 1)
+                from += "." + std::to_string(i - 1);
+            std::filesystem::path to = logPath;
+            to += "." + std::to_string(i);
+
+            std::error_code ec;
+            bool const fromExists = std::filesystem::exists(from, ec);
+            if (ec)
+            {
+                fail("cannot inspect rotated log");
+                return;
+            }
+            if (!fromExists)
+                continue;
+            if (std::filesystem::exists(to, ec))
+                std::filesystem::remove(to, ec);
+            if (ec)
+            {
+                fail("cannot remove old rotated log");
+                return;
+            }
+            std::filesystem::rename(from, to, ec);
+            if (ec)
+            {
+                fail("cannot rotate log file");
+                return;
+            }
+        }
+        output.clear();
+        output.open(logPath, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output.is_open())
+        {
+            fail("cannot reopen log file after rotation");
+            return;
+        }
+        fileBytes = 0;
+    }
+
+    output.write(line.data(), static_cast<std::streamsize>(line.size()));
+    output.flush();
+    if (!output.good())
+    {
+        fail("cannot write log file");
+        return;
+    }
+    fileBytes += line.size();
+}
+
+void LogBridgePacketToFile(char const* direction, Player* player, std::string const& opcode,
+                           std::size_t payloadBytes, std::size_t wireBytes, uint32 type)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    std::ostringstream line;
+    line << direction << " player=" << SanitizeLogValue(player->GetName(), kMaxBotNameLength)
+         << " opcode=" << SanitizeLogValue(opcode, kMaxOpcodeLength)
+         << " payloadBytes=" << payloadBytes << " wireBytes=" << wireBytes
+         << " type=" << type;
+    WriteBridgeFileLog(line.str());
+}
+
+void LogBridgeRejectionToFile(Player* player, std::string const& reason,
+                              std::size_t wireBytes, uint32 type)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    std::ostringstream line;
+    line << "REJECT player=" << SanitizeLogValue(player->GetName(), kMaxBotNameLength)
+         << " reason=" << SanitizeLogValue(reason, 32)
+         << " wireBytes=" << wireBytes << " type=" << type;
+    WriteBridgeFileLog(line.str());
+}
+// MB_BRIDGE_FILELOGS_V1_END
 
 BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& payload, std::string& reason)
 {
@@ -16922,6 +17104,8 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
             static_cast<uint32>(chatType));
     }
 
+    LogBridgePacketToFile("TX", player, opcode, payload.size(), wire.size(), static_cast<uint32>(chatType));
+
     WorldPacket data;
     ChatHandler::BuildChatPacket(data, chatType, LANG_ADDON, player, nullptr, wire.c_str());
     player->SendDirectMessage(&data);
@@ -19314,6 +19498,8 @@ void RunFleeOrderCommand(
 }
 // MB_FLEE_ORDER_V1_END
 
+void PrimeEquipEventBaseline(Player* requester, Player* bot);
+
 std::string BuildRosterPayload(Player* player)
 {
     std::ostringstream out;
@@ -19321,6 +19507,7 @@ std::string BuildRosterPayload(Player* player)
 
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
+        PrimeEquipEventBaseline(player, bot);
         if (!first)
             out << ';';
         first = false;
@@ -19983,6 +20170,95 @@ void ObserveBotEquipment(Player* requester, ChatMsg replyType,
     baseline.seenAt = now;
     SendEquipObserveDone(requester, replyType, encodedName, token, "OK");
 }
+// MB_R7_EVENT_EQUIP_V1_BEGIN
+// Called only for a requested roster or an actual equipment change.
+// The existing snapshot map stores IDs, never Player/Item pointers.
+std::map<std::pair<uint32, uint32>, EquipObserveBotState> sEquipEventBaselines;
+std::mutex sEquipEventMutex;
+
+void PrimeEquipEventBaseline(Player* requester, Player* bot)
+{
+    if (!requester || !bot || !requester->GetSession() || !requester->IsInWorld() ||
+        !bot->IsInWorld() || bot->IsBeingTeleported() ||
+        !IsBotInRequesterGroup(requester, bot) || !IsBotMasteredByRequester(requester, bot))
+        return;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return;
+
+    auto const current = ReadEquipObserveSlots(botAI);
+    auto const now = std::chrono::steady_clock::now();
+    auto const key = std::make_pair(requester->GetGUID().GetCounter(), bot->GetGUID().GetCounter());
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    if (sEquipEventBaselines.find(key) == sEquipEventBaselines.end() && sEquipEventBaselines.size() >= 256)
+    {
+        for (auto it = sEquipEventBaselines.begin(); it != sEquipEventBaselines.end();)
+        {
+            if (now - it->second.seenAt >= std::chrono::seconds(60))
+                it = sEquipEventBaselines.erase(it);
+            else
+                ++it;
+        }
+        if (sEquipEventBaselines.size() >= 256)
+            sEquipEventBaselines.erase(sEquipEventBaselines.begin());
+    }
+
+    EquipObserveBotState& baseline = sEquipEventBaselines[key];
+    baseline.slots = current;
+    baseline.mapId = bot->GetMapId();
+    baseline.seenAt = now;
+}
+
+void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
+{
+    if (!bot || slot >= EQUIPMENT_SLOT_END || !bot->IsInWorld() || bot->IsBeingTeleported())
+        return;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    Player* const master = botAI ? botAI->GetMaster() : nullptr;
+    if (!master || master == bot || !master->GetSession() || !master->IsInWorld() ||
+        master->IsBeingTeleported() || !IsBotInRequesterGroup(master, bot) ||
+        !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
+        return;
+
+    uint32 const newId = item ? item->GetEntry() : 0;
+    uint64 const newGuid = item ? static_cast<uint64>(item->GetGUID().GetCounter()) : 0;
+    uint32 oldId = 0;
+    bool needBaseline = false;
+    auto const key = std::make_pair(master->GetGUID().GetCounter(), bot->GetGUID().GetCounter());
+    {
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        auto existing = sEquipEventBaselines.find(key);
+        if (existing != sEquipEventBaselines.end() && existing->second.mapId == bot->GetMapId())
+        {
+            EquipObserveItemState& old = existing->second.slots[slot];
+            oldId = old.itemId;
+            if (old.itemId == newId && old.guidCounter == newGuid)
+                return;
+            old.itemId = newId;
+            old.guidCounter = newGuid;
+            existing->second.seenAt = std::chrono::steady_clock::now();
+        }
+        else
+            needBaseline = true;
+    }
+    if (needBaseline)
+    {
+        // First event after joining or reconnecting: the old ID may be unknown.
+        // Still notify so the visible inventory can refresh.
+        PrimeEquipEventBaseline(master, bot);
+    }
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(bot->GetName()) << kFieldSeparator
+            << static_cast<uint32>(slot) << kFieldSeparator << oldId
+            << kFieldSeparator << newId;
+    SendStateAddonPacket(master, CHAT_MSG_WHISPER, "EQUIP_CHANGED", payload.str());
+}
+// MB_R7_EVENT_EQUIP_V1_END
 // MB_INVENTORY_H1B1A_EQUIP_OBSERVE_V1_END
 
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
@@ -22090,6 +22366,7 @@ public:
                     type);
             }
 
+            LogBridgeRejectionToFile(player, reason, msg.size(), type);
             SendProtocolError(player, replyType, "", "", "", reason);
             return true;
         }
@@ -22108,6 +22385,7 @@ public:
                 type);
         }
 
+        LogBridgePacketToFile("RX", player, packet.first, packet.second.size(), msg.size(), type);
         return HandleBridgeOpcode(player, replyType, packet.first, packet.second);
     }
 
@@ -22120,6 +22398,11 @@ public:
     {
         NotifyPendingWarlockStoneItemCreated(player, item);
         NotifyPendingOrdinaryWarlockStoneItemCreated(player, item);
+    }
+
+    void OnPlayerAfterSetVisibleItemSlot(Player* player, uint8 slot, Item* item) override
+    {
+        NotifyEquipEvent(player, slot, item);
     }
 
     void OnPlayerBeforeLogout(Player* player) override
@@ -22160,5 +22443,6 @@ void AddSC_multibot_bridge()
 {
     if (BridgeConsoleLogsEnabled())
         LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+    WriteBridgeFileLog("STARTUP mod-multibot-bridge loaded");
     new MultiBotBridgePlayerScript();
 }
