@@ -20196,6 +20196,37 @@ void SendEquipObserveDone(Player* requester, ChatMsg replyType,
         std::string(1, kFieldSeparator) + status);
 }
 
+// Resolve only Players stored in the requester's own Map. FindBotByName
+// may inspect remote Players when bots are on another map thread.
+Player* FindLocalVisibleEquipmentBot(Player* requester, std::string const& botName)
+{
+    if (!requester || !requester->IsInWorld())
+        return nullptr;
+
+    Map const* const map = requester->GetMap();
+    if (!map)
+        return nullptr;
+
+    std::string const wanted = Trim(botName);
+    if (wanted.empty())
+        return nullptr;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (!candidate || candidate == requester || candidate->GetName() != wanted)
+            continue;
+
+        // Preserve the visibility rules: owner-managed bots plus random/addclass
+        // bots visible through the current group/master relationship.
+        bool const managed = mgr && mgr->GetPlayerBot(candidate->GetGUID()) == candidate;
+        if (managed || CanExposeRandomHolderBot(requester, candidate))
+            return candidate;
+    }
+    return nullptr;
+}
+
 void ObserveBotEquipment(Player* requester, ChatMsg replyType,
     std::string const& botName, std::string const& token)
 {
@@ -20203,7 +20234,7 @@ void ObserveBotEquipment(Player* requester, ChatMsg replyType,
         return;
 
     std::string const encodedName = UrlEncodeField(botName);
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
     {
         SendEquipObserveDone(requester, replyType, encodedName, token, "NO_BOT");
@@ -20335,8 +20366,24 @@ constexpr std::chrono::seconds kEquipPendingTtl(60);
 
 void PrimeEquipEventBaseline(Player* requester, Player* bot)
 {
-    if (!requester || !bot || !requester->GetSession() || !requester->IsInWorld() ||
-        !bot->IsInWorld() || bot->IsBeingTeleported() ||
+    if (!requester || !bot || !requester->GetSession() || !requester->IsInWorld())
+        return;
+
+    // Pointer equality does not dereference a remote bot. Only use the bot
+    // after finding its pointer among the requester's map-local references.
+    Map const* const map = requester->GetMap();
+    if (!map)
+        return;
+    bool localBot = false;
+    for (auto const& reference : map->GetPlayers())
+    {
+        if (reference.GetSource() == bot)
+        {
+            localBot = true;
+            break;
+        }
+    }
+    if (!localBot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
         !IsBotMasteredByRequester(requester, bot))
         return;
 
@@ -20374,8 +20421,28 @@ void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
         return;
 
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
-    Player* const master = botAI ? botAI->GetMaster() : nullptr;
-    if (!master || master == bot || !master->GetSession() || !master->IsInWorld() ||
+    Player* const masterCandidate = botAI ? botAI->GetMaster() : nullptr;
+    if (!masterCandidate || masterCandidate == bot)
+        return;
+
+    // This hook executes in the bot's map context. A master pointer from AI
+    // may refer to a Player on another map thread: compare addresses only.
+    Map const* const map = bot->GetMap();
+    if (!map)
+        return;
+    Player* master = nullptr;
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (candidate == masterCandidate)
+        {
+            master = candidate;
+            break;
+        }
+    }
+    // Never read session, world state or security from a remote master.
+    // On a map change, the equipment baseline is reset by the lifecycle hook.
+    if (!master || !master->GetSession() || !master->IsInWorld() ||
         master->IsBeingTeleported() ||
         !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
         !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
