@@ -369,6 +369,7 @@ bool BridgeFileLogsEnabled()
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
+Player* FindLocalVisibleEquipmentBot(Player* requester, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 bool ConsumeSelfBotRequestRateLimit(Player* requester);
 bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
@@ -17438,7 +17439,7 @@ void SendWeaponEnchantDebugPacket(
     uint32 offEnchant = 0;
     uint32 offDuration = 0;
 
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!ConsumeWeaponEnchantDebugRateLimit(requester))
     {
         status = "RATE_LIMIT";
@@ -17529,7 +17530,7 @@ void SendWarlockStoneStatePacket(
     uint32 enchantId = 0;
     uint32 duration = 0;
 
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!ConsumeWarlockStoneStateRateLimit(requester))
     {
         status = "RATE_LIMIT";
