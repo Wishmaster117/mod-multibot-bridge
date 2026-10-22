@@ -17344,12 +17344,15 @@ bool CanExposeRandomHolderBot(Player* requester, Player* bot)
     return IsBotMasteredByRequester(requester, bot) || IsBotInRequesterGroup(requester, bot);
 }
 
-void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
+// The PlayerBotMap key is the identity. Do not dereference a possibly
+// map-remote Player merely to obtain the GUID for duplicate suppression.
+void AppendBridgeVisibleBot(ObjectGuid const& botGuid, Player* bot,
+    std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
 {
     if (!bot || !bot->IsInWorld())
         return;
 
-    if (!seen.insert(bot->GetGUID()).second)
+    if (!seen.insert(botGuid).second)
         return;
 
     bots.push_back(bot);
@@ -17365,13 +17368,13 @@ std::vector<Player*> GetBridgeVisibleBots(Player* player)
 
     if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
         for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-            AppendBridgeVisibleBot(it->second, bots, seen);
+            AppendBridgeVisibleBot(it->first, it->second, bots, seen);
 
     for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
     {
         Player* const bot = it->second;
         if (CanExposeRandomHolderBot(player, bot))
-            AppendBridgeVisibleBot(bot, bots, seen);
+            AppendBridgeVisibleBot(it->first, bot, bots, seen);
     }
 
     return bots;
