@@ -4,3 +4,9 @@
 # 1 = enabled
 # 0 = disabled
 MultiBotBridge.EnableConsoleLogs = 0
+
+# Enable bridge file logs (RX / TX / rejects / startup).
+# Files are written under the already configured Worldserver LogsDir.
+# 1 = enabled (MultiBotBridge.log, 16 MiB x 4 files including rotations)
+# 0 = disabled (default)
+MultiBotBridge.EnableFileLogs = 0

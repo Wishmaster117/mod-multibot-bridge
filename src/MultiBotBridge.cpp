@@ -14,6 +14,8 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
+#include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -50,6 +52,8 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <atomic>
 #include <random>
 #include <unordered_set>
 #include <array>
@@ -58,13 +62,29 @@
 #include <cstdlib>
 #include <chrono>
 #include <deque>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 // mod-playerbots #2854 renamed PlayerbotAIConfig members; support old and new headers.
 // Once all supported Playerbots versions have the new names, this compatibility layer can be removed.
@@ -251,6 +271,7 @@ std::size_t constexpr kMaxOutfitFrameSets = 128;
 std::size_t constexpr kMaxOutfitFramePartsPerSet = 128;
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kEquipObserveCapability = "EQUIP_OBSERVE_V1";
+char const* const kEquipEventsCapability = "EQUIP_EVENTS_V1";
 char const* const kInventoryExactCapability = "INVENTORY_EXACT_V1";
 char const* const kInventoryItemMoveCapability = "ITEM_MOVE_V1";
 char const* const kInventoryItemTradeCapability = "ITEM_TRADE_V1";
@@ -342,7 +363,13 @@ bool BridgeConsoleLogsEnabled()
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
 }
 
+bool BridgeFileLogsEnabled()
+{
+    return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableFileLogs", false);
+}
+
 Player* FindBotByName(Player* player, std::string const& botName);
+Player* FindLocalVisibleEquipmentBot(Player* requester, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 bool ConsumeSelfBotRequestRateLimit(Player* requester);
 bool ConsumeSelfBotHeavyActionRateLimit(Player* requester);
@@ -436,6 +463,7 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kOutfitFramingCapability,
         kInventoryCapability,
         kEquipObserveCapability,
+        kEquipEventsCapability,
         kInventoryExactCapability,
         kInventoryItemMoveCapability,
         kInventoryItemTradeCapability,
@@ -713,6 +741,289 @@ std::string SanitizeLogValue(std::string const& value, std::size_t maxLength)
 
     return out;
 }
+
+// MB_BRIDGE_FILELOGS_V1_BEGIN
+// Log file handles must never resolve through an attacker-replaced symbolic link.
+// Native open + no-follow flag + descriptor validation avoid check/open races.
+class SecureBridgeLogOutput
+{
+public:
+    ~SecureBridgeLogOutput() { Close(); }
+    SecureBridgeLogOutput(SecureBridgeLogOutput const&) = delete;
+    SecureBridgeLogOutput& operator=(SecureBridgeLogOutput const&) = delete;
+    SecureBridgeLogOutput() = default;
+
+    bool Open(std::filesystem::path const& path, bool truncate)
+    {
+        Close();
+#ifdef _WIN32
+        // Open an existing object without following its reparse point, or create
+        // a new object atomically. Never use CREATE_ALWAYS before validation.
+        HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE && ::GetLastError() == ERROR_FILE_NOT_FOUND)
+            file = ::CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        BY_HANDLE_FILE_INFORMATION information{};
+        LARGE_INTEGER size{};
+        if (!::GetFileInformationByHandle(file, &information) ||
+            (information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+            !::GetFileSizeEx(file, &size) || size.QuadPart < 0)
+        {
+            ::CloseHandle(file);
+            return false;
+        }
+        if (truncate)
+        {
+            LARGE_INTEGER zero{};
+            if (!::SetFilePointerEx(file, zero, nullptr, FILE_BEGIN) || !::SetEndOfFile(file))
+            {
+                ::CloseHandle(file);
+                return false;
+            }
+        }
+        handle_ = file;
+        size_ = truncate ? 0 : static_cast<std::uintmax_t>(size.QuadPart);
+#else
+        int const fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+        if (fd < 0)
+            return false;
+        struct stat information{};
+        if (::fstat(fd, &information) != 0 || !S_ISREG(information.st_mode) || information.st_size < 0 ||
+            (truncate && ::ftruncate(fd, 0) != 0))
+        {
+            ::close(fd);
+            return false;
+        }
+        fd_ = fd;
+        size_ = truncate ? 0 : static_cast<std::uintmax_t>(information.st_size);
+#endif
+        return true;
+    }
+
+    std::uintmax_t Size() const { return size_; }
+
+    bool Flush()
+    {
+#ifdef _WIN32
+        return handle_ != INVALID_HANDLE_VALUE; // WriteFile already sends data to the OS.
+#else
+        return fd_ >= 0; // write() has no userspace stream buffer to flush.
+#endif
+    }
+
+    bool Write(std::string const& data)
+    {
+#ifdef _WIN32
+        if (handle_ == INVALID_HANDLE_VALUE || data.size() > std::numeric_limits<DWORD>::max())
+            return false;
+        LARGE_INTEGER zero{};
+        DWORD written = 0;
+        if (!::SetFilePointerEx(handle_, zero, nullptr, FILE_END) ||
+            !::WriteFile(handle_, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) ||
+            written != data.size())
+            return false;
+#else
+        if (fd_ < 0)
+            return false;
+        std::size_t done = 0;
+        while (done < data.size())
+        {
+            ssize_t const written = ::write(fd_, data.data() + done, data.size() - done);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                return false;
+            done += static_cast<std::size_t>(written);
+        }
+#endif
+        size_ += data.size();
+        return Flush();
+    }
+
+    void Close()
+    {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+        size_ = 0;
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+    std::uintmax_t size_ = 0;
+};
+
+// Diagnostic traffic only. All filesystem writes stay inside the configured LogsDir.
+// When disabled (the default), no file is opened or created.
+void WriteBridgeFileLog(std::string const& message)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    constexpr std::uintmax_t maxFileBytes = 16u * 1024u * 1024u;
+    constexpr int rotatedFiles = 3;
+    static std::mutex logMutex;
+    static SecureBridgeLogOutput output;
+    static std::uintmax_t fileBytes = 0;
+    static bool initialized = false;
+    static bool disabledAfterError = false;
+
+    std::lock_guard<std::mutex> const guard(logMutex);
+    if (disabledAfterError)
+        return;
+
+    auto fail = [](char const* reason)
+    {
+        disabledAfterError = true;
+        LOG_WARN("server.loading", "MultiBotBridge file logging disabled: {}", reason);
+    };
+
+    std::filesystem::path const logPath = std::filesystem::path(sLog->GetLogsDir()) / "MultiBotBridge.log";
+    if (!initialized)
+    {
+        std::error_code ec;
+        std::filesystem::path const logDirectory = logPath.has_parent_path()
+            ? logPath.parent_path() : std::filesystem::path(".");
+        if (!std::filesystem::is_directory(logDirectory, ec) || ec)
+        {
+            fail("configured log directory is missing or inaccessible");
+            return;
+        }
+
+        // Open is race-safe: it rejects a symlink/reparse point on the final
+        // file name using the actual opened descriptor/handle.
+        if (!output.Open(logPath, false))
+        {
+            fail("cannot securely open log file");
+            return;
+        }
+        fileBytes = output.Size();
+        initialized = true;
+    }
+
+    auto const now = std::chrono::system_clock::now();
+    std::time_t const rawTime = std::chrono::system_clock::to_time_t(now);
+    std::tm utcTime{};
+#ifdef _WIN32
+    if (gmtime_s(&utcTime, &rawTime) != 0)
+#else
+    if (gmtime_r(&rawTime, &utcTime) == nullptr)
+#endif
+    {
+        fail("cannot convert log timestamp");
+        return;
+    }
+    auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000;
+    std::ostringstream lineStream;
+    lineStream << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%S") << '.'
+               << std::setw(3) << std::setfill('0') << millis << "Z " << message << '\n';
+    std::string const line = lineStream.str();
+
+    if (fileBytes + line.size() > maxFileBytes)
+    {
+        if (!output.Flush())
+        {
+            fail("cannot flush log file for rotation");
+            return;
+        }
+        output.Close();
+        for (int i = rotatedFiles; i >= 1; --i)
+        {
+            std::filesystem::path from = logPath;
+            if (i > 1)
+                from += "." + std::to_string(i - 1);
+            std::filesystem::path to = logPath;
+            to += "." + std::to_string(i);
+
+            std::error_code ec;
+            bool const fromExists = std::filesystem::exists(from, ec);
+            if (ec)
+            {
+                fail("cannot inspect rotated log");
+                return;
+            }
+            if (!fromExists)
+                continue;
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(from, ec)) || ec)
+            {
+                fail("rotated log source is a symlink or cannot be inspected");
+                return;
+            }
+            if (std::filesystem::exists(to, ec))
+                std::filesystem::remove(to, ec);
+            if (ec)
+            {
+                fail("cannot remove old rotated log");
+                return;
+            }
+            std::filesystem::rename(from, to, ec);
+            if (ec)
+            {
+                fail("cannot rotate log file");
+                return;
+            }
+        }
+        if (!output.Open(logPath, true))
+        {
+            fail("cannot securely reopen log file after rotation");
+            return;
+        }
+        fileBytes = 0;
+    }
+
+    if (!output.Write(line))
+    {
+        fail("cannot write log file");
+        return;
+    }
+    fileBytes += line.size();
+}
+
+void LogBridgePacketToFile(char const* direction, Player* player, std::string const& opcode,
+                           std::size_t payloadBytes, std::size_t wireBytes, uint32 type)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    std::ostringstream line;
+    line << direction << " player=" << SanitizeLogValue(player->GetName(), kMaxBotNameLength)
+         << " opcode=" << SanitizeLogValue(opcode, kMaxOpcodeLength)
+         << " payloadBytes=" << payloadBytes << " wireBytes=" << wireBytes
+         << " type=" << type;
+    WriteBridgeFileLog(line.str());
+}
+
+void LogBridgeRejectionToFile(Player* player, std::string const& reason,
+                              std::size_t wireBytes, uint32 type)
+{
+    if (!BridgeFileLogsEnabled())
+        return;
+
+    std::ostringstream line;
+    line << "REJECT player=" << SanitizeLogValue(player->GetName(), kMaxBotNameLength)
+         << " reason=" << SanitizeLogValue(reason, 32)
+         << " wireBytes=" << wireBytes << " type=" << type;
+    WriteBridgeFileLog(line.str());
+}
+// MB_BRIDGE_FILELOGS_V1_END
 
 BridgePayloadStatus TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& payload, std::string& reason)
 {
@@ -11221,12 +11532,38 @@ void RunBotReleaseCommand(Player* requester, ChatMsg replyType, std::string cons
 
 void NotifyBotDeath(Player* bot)
 {
-    if (!bot || bot->IsAlive()) return;
+    if (!bot || bot->IsAlive() || !bot->IsInWorld() || bot->IsBeingTeleported())
+        return;
+
     PlayerbotAI* const botAI = GetBotAI(bot);
-    Player* const requester = botAI ? botAI->GetMaster() : nullptr;
-    if (!requester || requester == bot || !requester->GetSession() || !requester->IsInWorld()) return;
-    if (!IsBotMasteredByRequester(requester, bot)) return;
-    SendAddonPacket(requester, CHAT_MSG_WHISPER, "BOT_DEATH", UrlEncodeField(bot->GetName()));
+    Player* const masterCandidate = botAI ? botAI->GetMaster() : nullptr;
+    if (!masterCandidate || masterCandidate == bot)
+        return;
+
+    // OnPlayerJustDied executes on the bot's map. The master's pointer may
+    // belong to another map thread: compare addresses, never dereference it.
+    Map const* const map = bot->GetMap();
+    if (!map)
+        return;
+
+    Player* master = nullptr;
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (candidate == masterCandidate)
+        {
+            master = candidate;
+            break;
+        }
+    }
+
+    // Send only while the master is proven map-local. Cross-map notifications
+    // require a separate, validated deferred-delivery design (not part of G0).
+    if (!master || !master->GetSession() || !master->IsInWorld() ||
+        master->IsBeingTeleported() || !IsBotMasteredByRequester(master, bot))
+        return;
+
+    SendAddonPacket(master, CHAT_MSG_WHISPER, "BOT_DEATH", UrlEncodeField(bot->GetName()));
 }
 // MB_BOT_RELEASE_V1_END
 // MB_QUEST_ACCEPT_ALL_V1_BEGIN
@@ -16922,6 +17259,8 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
             static_cast<uint32>(chatType));
     }
 
+    LogBridgePacketToFile("TX", player, opcode, payload.size(), wire.size(), static_cast<uint32>(chatType));
+
     WorldPacket data;
     ChatHandler::BuildChatPacket(data, chatType, LANG_ADDON, player, nullptr, wire.c_str());
     player->SendDirectMessage(&data);
@@ -17006,12 +17345,15 @@ bool CanExposeRandomHolderBot(Player* requester, Player* bot)
     return IsBotMasteredByRequester(requester, bot) || IsBotInRequesterGroup(requester, bot);
 }
 
-void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
+// The PlayerBotMap key is the identity. Do not dereference a possibly
+// map-remote Player merely to obtain the GUID for duplicate suppression.
+void AppendBridgeVisibleBot(ObjectGuid const& botGuid, Player* bot,
+    std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
 {
     if (!bot || !bot->IsInWorld())
         return;
 
-    if (!seen.insert(bot->GetGUID()).second)
+    if (!seen.insert(botGuid).second)
         return;
 
     bots.push_back(bot);
@@ -17027,13 +17369,13 @@ std::vector<Player*> GetBridgeVisibleBots(Player* player)
 
     if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
         for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-            AppendBridgeVisibleBot(it->second, bots, seen);
+            AppendBridgeVisibleBot(it->first, it->second, bots, seen);
 
     for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
     {
         Player* const bot = it->second;
         if (CanExposeRandomHolderBot(player, bot))
-            AppendBridgeVisibleBot(bot, bots, seen);
+            AppendBridgeVisibleBot(it->first, bot, bots, seen);
     }
 
     return bots;
@@ -17097,7 +17439,7 @@ void SendWeaponEnchantDebugPacket(
     uint32 offEnchant = 0;
     uint32 offDuration = 0;
 
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!ConsumeWeaponEnchantDebugRateLimit(requester))
     {
         status = "RATE_LIMIT";
@@ -17188,7 +17530,7 @@ void SendWarlockStoneStatePacket(
     uint32 enchantId = 0;
     uint32 duration = 0;
 
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!ConsumeWarlockStoneStateRateLimit(requester))
     {
         status = "RATE_LIMIT";
@@ -19314,6 +19656,8 @@ void RunFleeOrderCommand(
 }
 // MB_FLEE_ORDER_V1_END
 
+void PrimeEquipEventBaseline(Player* requester, Player* bot);
+
 std::string BuildRosterPayload(Player* player)
 {
     std::ostringstream out;
@@ -19321,6 +19665,7 @@ std::string BuildRosterPayload(Player* player)
 
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
+        PrimeEquipEventBaseline(player, bot);
         if (!first)
             out << ';';
         first = false;
@@ -19881,6 +20226,37 @@ void SendEquipObserveDone(Player* requester, ChatMsg replyType,
         std::string(1, kFieldSeparator) + status);
 }
 
+// Resolve only Players stored in the requester's own Map. FindBotByName
+// may inspect remote Players when bots are on another map thread.
+Player* FindLocalVisibleEquipmentBot(Player* requester, std::string const& botName)
+{
+    if (!requester || !requester->IsInWorld())
+        return nullptr;
+
+    Map const* const map = requester->GetMap();
+    if (!map)
+        return nullptr;
+
+    std::string const wanted = Trim(botName);
+    if (wanted.empty())
+        return nullptr;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (!candidate || candidate == requester || candidate->GetName() != wanted)
+            continue;
+
+        // Preserve the visibility rules: owner-managed bots plus random/addclass
+        // bots visible through the current group/master relationship.
+        bool const managed = mgr && mgr->GetPlayerBot(candidate->GetGUID()) == candidate;
+        if (managed || CanExposeRandomHolderBot(requester, candidate))
+            return candidate;
+    }
+    return nullptr;
+}
+
 void ObserveBotEquipment(Player* requester, ChatMsg replyType,
     std::string const& botName, std::string const& token)
 {
@@ -19888,7 +20264,7 @@ void ObserveBotEquipment(Player* requester, ChatMsg replyType,
         return;
 
     std::string const encodedName = UrlEncodeField(botName);
-    Player* const bot = FindBotByName(requester, botName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
     if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported())
     {
         SendEquipObserveDone(requester, replyType, encodedName, token, "NO_BOT");
@@ -19983,6 +20359,357 @@ void ObserveBotEquipment(Player* requester, ChatMsg replyType,
     baseline.seenAt = now;
     SendEquipObserveDone(requester, replyType, encodedName, token, "OK");
 }
+// MB_R7_EVENT_EQUIP_V1_BEGIN
+// R8: events are coalesced per owner/bot/slot, then sent from the owner's
+// normal PlayerScript update. No Player/Item pointer survives the callback.
+std::map<std::pair<uint32, uint32>, EquipObserveBotState> sEquipEventBaselines;
+std::mutex sEquipEventMutex;
+
+struct EquipPendingSlot
+{
+    EquipObserveItemState oldItem;
+    EquipObserveItemState newItem;
+};
+struct EquipPendingBot
+{
+    uint32 mapId = 0;
+    std::map<uint8, EquipPendingSlot> slots;
+    std::chrono::steady_clock::time_point firstQueued = {};
+    std::chrono::steady_clock::time_point touchedAt = {};
+};
+std::map<std::pair<uint32, uint32>, EquipPendingBot> sEquipPendingBots;
+// A lock-free empty-queue fast path for the high-frequency PlayerScript update.
+// Synchronize the hint on *every* queue mutation while the queue mutex is held.
+std::atomic<bool> sEquipHasPendingEvents{false};
+struct EquipPendingFlagSync
+{
+    ~EquipPendingFlagSync()
+    {
+        sEquipHasPendingEvents.store(!sEquipPendingBots.empty(), std::memory_order_release);
+    }
+};
+std::map<uint32, std::chrono::steady_clock::time_point> sEquipLastFlush;
+constexpr std::size_t kEquipMaxPendingBotPairs = 256;
+constexpr std::size_t kEquipMaxPacketsPerFlush = 6;
+constexpr std::chrono::milliseconds kEquipFlushInterval(150);
+constexpr std::chrono::seconds kEquipPendingTtl(60);
+
+void PrimeEquipEventBaseline(Player* requester, Player* bot)
+{
+    if (!requester || !bot || !requester->GetSession() || !requester->IsInWorld())
+        return;
+
+    // Pointer equality does not dereference a remote bot. Only use the bot
+    // after finding its pointer among the requester's map-local references.
+    Map const* const map = requester->GetMap();
+    if (!map)
+        return;
+    bool localBot = false;
+    for (auto const& reference : map->GetPlayers())
+    {
+        if (reference.GetSource() == bot)
+        {
+            localBot = true;
+            break;
+        }
+    }
+    if (!localBot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+        !IsBotMasteredByRequester(requester, bot))
+        return;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return;
+
+    auto const current = ReadEquipObserveSlots(botAI);
+    auto const now = std::chrono::steady_clock::now();
+    auto const key = std::make_pair(requester->GetGUID().GetCounter(), bot->GetGUID().GetCounter());
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    if (sEquipEventBaselines.find(key) == sEquipEventBaselines.end() && sEquipEventBaselines.size() >= 256)
+    {
+        for (auto it = sEquipEventBaselines.begin(); it != sEquipEventBaselines.end();)
+        {
+            if (now - it->second.seenAt >= std::chrono::seconds(60))
+                it = sEquipEventBaselines.erase(it);
+            else
+                ++it;
+        }
+        if (sEquipEventBaselines.size() >= 256)
+            sEquipEventBaselines.erase(sEquipEventBaselines.begin());
+    }
+
+    EquipObserveBotState& baseline = sEquipEventBaselines[key];
+    baseline.slots = current;
+    baseline.mapId = bot->GetMapId();
+    baseline.seenAt = now;
+}
+
+void NotifyEquipEvent(Player* bot, uint8 slot, Item* item)
+{
+    if (!bot || slot >= EQUIPMENT_SLOT_END || !bot->IsInWorld() || bot->IsBeingTeleported())
+        return;
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    Player* const masterCandidate = botAI ? botAI->GetMaster() : nullptr;
+    if (!masterCandidate || masterCandidate == bot)
+        return;
+
+    // This hook executes in the bot's map context. A master pointer from AI
+    // may refer to a Player on another map thread: compare addresses only.
+    Map const* const map = bot->GetMap();
+    if (!map)
+        return;
+    Player* master = nullptr;
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (candidate == masterCandidate)
+        {
+            master = candidate;
+            break;
+        }
+    }
+    // Never read session, world state or security from a remote master.
+    // On a map change, the equipment baseline is reset by the lifecycle hook.
+    if (!master || !master->GetSession() || !master->IsInWorld() ||
+        master->IsBeingTeleported() ||
+        !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
+        return;
+
+    EquipObserveItemState const newItem = {
+        item ? static_cast<uint64>(item->GetGUID().GetCounter()) : 0,
+        item ? item->GetEntry() : 0
+    };
+    auto const key = std::make_pair(master->GetGUID().GetCounter(), bot->GetGUID().GetCounter());
+    uint32 const mapId = bot->GetMapId();
+    bool hasBaseline = false;
+    {
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        auto existing = sEquipEventBaselines.find(key);
+        hasBaseline = existing != sEquipEventBaselines.end() && existing->second.mapId == mapId;
+    }
+    if (!hasBaseline)
+    {
+        // As before: read the full snapshot on the first event. Because it
+        // already contains the changed item, its previous ID is unknown.
+        PrimeEquipEventBaseline(master, bot);
+    }
+
+    auto const now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    EquipPendingFlagSync const pendingSync;
+    auto baseline = sEquipEventBaselines.find(key);
+    if (baseline == sEquipEventBaselines.end() || baseline->second.mapId != mapId)
+        return;
+    EquipObserveItemState const oldItem = hasBaseline ? baseline->second.slots[slot] : EquipObserveItemState{};
+    auto pending = sEquipPendingBots.find(key);
+    if (pending != sEquipPendingBots.end() && pending->second.mapId != mapId)
+    {
+        sEquipPendingBots.erase(pending);
+        pending = sEquipPendingBots.end();
+    }
+    if (pending == sEquipPendingBots.end() &&
+        oldItem.itemId == newItem.itemId && oldItem.guidCounter == newItem.guidCounter)
+        return;
+
+    if (pending == sEquipPendingBots.end())
+    {
+        if (sEquipPendingBots.size() >= kEquipMaxPendingBotPairs)
+        {
+            for (auto it = sEquipPendingBots.begin(); it != sEquipPendingBots.end();)
+            {
+                if (now - it->second.touchedAt >= kEquipPendingTtl)
+                    it = sEquipPendingBots.erase(it);
+                else
+                    ++it;
+            }
+        }
+        // Do not grow the queue without a bound. An exceptional over-capacity
+        // event can be resynchronized through the next requested roster.
+        if (sEquipPendingBots.size() >= kEquipMaxPendingBotPairs)
+            return;
+        pending = sEquipPendingBots.emplace(key, EquipPendingBot{}).first;
+        pending->second.mapId = mapId;
+        pending->second.firstQueued = now;
+    }
+    EquipPendingBot& state = pending->second;
+    state.touchedAt = now;
+    auto change = state.slots.find(slot);
+    if (change == state.slots.end())
+        change = state.slots.emplace(slot, EquipPendingSlot{oldItem, newItem}).first;
+    else
+        change->second.newItem = newItem;
+
+    if (change->second.oldItem.itemId == newItem.itemId &&
+        change->second.oldItem.guidCounter == newItem.guidCounter)
+        state.slots.erase(change); // E.g. A -> B -> A before the flush.
+    if (state.slots.empty())
+        sEquipPendingBots.erase(pending);
+}
+
+struct EquipSelectedEvent
+{
+    std::pair<uint32, uint32> key;
+    uint32 mapId = 0;
+    uint8 slot = 0;
+    EquipObserveItemState newItem;
+    uint32 oldId = 0;
+};
+
+void FlushEquipEvents(Player* master)
+{
+    if (!master || !master->GetSession() || !master->IsInWorld() || master->IsBeingTeleported())
+        return;
+
+    if (!sEquipHasPendingEvents.load(std::memory_order_acquire))
+        return;
+
+    uint32 const ownerId = master->GetGUID().GetCounter();
+    auto const now = std::chrono::steady_clock::now();
+    std::vector<EquipSelectedEvent> selected;
+    {
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        if (sEquipPendingBots.empty())
+            return;
+        auto last = sEquipLastFlush.find(ownerId);
+        if (last != sEquipLastFlush.end() && now - last->second < kEquipFlushInterval)
+            return;
+        // The queue is ordered by (owner, bot): only inspect this owner's entries.
+        for (auto it = sEquipPendingBots.lower_bound({ownerId, 0});
+             it != sEquipPendingBots.end() && it->first.first == ownerId; ++it)
+        {
+            auto const& entry = *it;
+            if (now - entry.second.firstQueued < kEquipFlushInterval)
+                continue;
+            for (auto const& change : entry.second.slots)
+            {
+                selected.push_back({entry.first, entry.second.mapId, change.first,
+                    change.second.newItem, change.second.oldItem.itemId});
+                if (selected.size() >= kEquipMaxPacketsPerFlush)
+                    break;
+            }
+            if (selected.size() >= kEquipMaxPacketsPerFlush)
+                break;
+        }
+        if (selected.empty())
+            return;
+        if (sEquipLastFlush.size() >= 512)
+        {
+            for (auto it = sEquipLastFlush.begin(); it != sEquipLastFlush.end();)
+            {
+                if (now - it->second >= kEquipPendingTtl)
+                    it = sEquipLastFlush.erase(it);
+                else
+                    ++it;
+            }
+        }
+        if (sEquipLastFlush.size() < 512 || sEquipLastFlush.count(ownerId) > 0)
+            sEquipLastFlush[ownerId] = now;
+    }
+
+    // Only dereference Players belonging to the master's own Map instance.
+    // GetBridgeVisibleBots may return Players updated by a different map thread.
+    // Iterate the map-local references instead; do not retain their pointers.
+    Map const* const ownerMap = master->GetMap();
+    if (!ownerMap)
+        return;
+    for (EquipSelectedEvent const& event : selected)
+    {
+        Player* bot = nullptr;
+        for (auto const& reference : ownerMap->GetPlayers())
+        {
+            Player* const candidate = reference.GetSource();
+            if (candidate && candidate->GetGUID().GetCounter() == event.key.second)
+            {
+                bot = candidate;
+                break;
+            }
+        }
+        // The bot is not on the owner's map instance: drop its obsolete pair.
+        // Keeping it would repeatedly occupy the first six flush slots and
+        // starve reachable bots. Map changes rebuild the equipment baseline.
+        if (!bot)
+        {
+            std::lock_guard<std::mutex> guard(sEquipEventMutex);
+            EquipPendingFlagSync const pendingSync;
+            sEquipPendingBots.erase(event.key);
+            sEquipEventBaselines.erase(event.key);
+            continue;
+        }
+        PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+            bot->GetMapId() != event.mapId || !botAI ||
+            !IsBotMasteredByRequester(master, bot) || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, master))
+        {
+            std::lock_guard<std::mutex> guard(sEquipEventMutex);
+            EquipPendingFlagSync const pendingSync;
+            sEquipPendingBots.erase(event.key);
+            sEquipEventBaselines.erase(event.key);
+            continue;
+        }
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName()) << kFieldSeparator
+                << static_cast<uint32>(event.slot) << kFieldSeparator << event.oldId
+                << kFieldSeparator << event.newItem.itemId;
+        if (!SendStateAddonPacket(master, CHAT_MSG_WHISPER, "EQUIP_CHANGED", payload.str()))
+            break; // Keep the pending change for the next owner update.
+
+        // Only now advance the baseline. If a newer callback arrived during
+        // the send, retain that pending slot with the just-sent item as its old.
+        std::lock_guard<std::mutex> guard(sEquipEventMutex);
+        EquipPendingFlagSync const pendingSync;
+        auto pending = sEquipPendingBots.find(event.key);
+        if (pending == sEquipPendingBots.end() || pending->second.mapId != event.mapId)
+            continue;
+        auto change = pending->second.slots.find(event.slot);
+        if (change == pending->second.slots.end())
+            continue;
+        auto baseline = sEquipEventBaselines.find(event.key);
+        if (baseline != sEquipEventBaselines.end() && baseline->second.mapId == event.mapId)
+        {
+            baseline->second.slots[event.slot] = event.newItem;
+            baseline->second.seenAt = now;
+        }
+        if (change->second.newItem.itemId == event.newItem.itemId &&
+            change->second.newItem.guidCounter == event.newItem.guidCounter)
+            pending->second.slots.erase(change);
+        else
+        {
+            change->second.oldItem = event.newItem;
+            pending->second.firstQueued = now;
+        }
+        if (pending->second.slots.empty())
+            sEquipPendingBots.erase(pending);
+    }
+}
+
+void ClearEquipEventState(Player* player)
+{
+    if (!player)
+        return;
+    uint32 const id = player->GetGUID().GetCounter();
+    std::lock_guard<std::mutex> guard(sEquipEventMutex);
+    EquipPendingFlagSync const pendingSync;
+    for (auto it = sEquipPendingBots.begin(); it != sEquipPendingBots.end();)
+    {
+        if (it->first.first == id || it->first.second == id)
+            it = sEquipPendingBots.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = sEquipEventBaselines.begin(); it != sEquipEventBaselines.end();)
+    {
+        if (it->first.first == id || it->first.second == id)
+            it = sEquipEventBaselines.erase(it);
+        else
+            ++it;
+    }
+    sEquipLastFlush.erase(id);
+}
+// MB_R7_EVENT_EQUIP_V1_END
 // MB_INVENTORY_H1B1A_EQUIP_OBSERVE_V1_END
 
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
@@ -22090,6 +22817,7 @@ public:
                     type);
             }
 
+            LogBridgeRejectionToFile(player, reason, msg.size(), type);
             SendProtocolError(player, replyType, "", "", "", reason);
             return true;
         }
@@ -22108,6 +22836,7 @@ public:
                 type);
         }
 
+        LogBridgePacketToFile("RX", player, packet.first, packet.second.size(), msg.size(), type);
         return HandleBridgeOpcode(player, replyType, packet.first, packet.second);
     }
 
@@ -22122,14 +22851,26 @@ public:
         NotifyPendingOrdinaryWarlockStoneItemCreated(player, item);
     }
 
+    void OnPlayerAfterSetVisibleItemSlot(Player* player, uint8 slot, Item* item) override
+    {
+        NotifyEquipEvent(player, slot, item);
+    }
+
+    void OnPlayerAfterUpdate(Player* player, uint32 /*p_time*/) override
+    {
+        FlushEquipEvents(player);
+    }
+
     void OnPlayerBeforeLogout(Player* player) override
     {
+        ClearEquipEventState(player);
         CancelPendingWarlockStoneSwitch(player, "STONE_LOGOUT", false);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_LOGOUT", false);
     }
 
     void OnPlayerMapChanged(Player* player) override
     {
+        ClearEquipEventState(player);
         CancelPendingWarlockStoneSwitch(player, "STONE_MAP_CHANGED", true);
         CancelPendingOrdinaryWarlockStoneSwitchesForPlayer(player, "STONE_MAP_CHANGED", true);
     }
@@ -22160,5 +22901,6 @@ void AddSC_multibot_bridge()
 {
     if (BridgeConsoleLogsEnabled())
         LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+    WriteBridgeFileLog("STARTUP mod-multibot-bridge loaded");
     new MultiBotBridgePlayerScript();
 }
