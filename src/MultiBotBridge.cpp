@@ -11531,12 +11531,38 @@ void RunBotReleaseCommand(Player* requester, ChatMsg replyType, std::string cons
 
 void NotifyBotDeath(Player* bot)
 {
-    if (!bot || bot->IsAlive()) return;
+    if (!bot || bot->IsAlive() || !bot->IsInWorld() || bot->IsBeingTeleported())
+        return;
+
     PlayerbotAI* const botAI = GetBotAI(bot);
-    Player* const requester = botAI ? botAI->GetMaster() : nullptr;
-    if (!requester || requester == bot || !requester->GetSession() || !requester->IsInWorld()) return;
-    if (!IsBotMasteredByRequester(requester, bot)) return;
-    SendAddonPacket(requester, CHAT_MSG_WHISPER, "BOT_DEATH", UrlEncodeField(bot->GetName()));
+    Player* const masterCandidate = botAI ? botAI->GetMaster() : nullptr;
+    if (!masterCandidate || masterCandidate == bot)
+        return;
+
+    // OnPlayerJustDied executes on the bot's map. The master's pointer may
+    // belong to another map thread: compare addresses, never dereference it.
+    Map const* const map = bot->GetMap();
+    if (!map)
+        return;
+
+    Player* master = nullptr;
+    for (auto const& reference : map->GetPlayers())
+    {
+        Player* const candidate = reference.GetSource();
+        if (candidate == masterCandidate)
+        {
+            master = candidate;
+            break;
+        }
+    }
+
+    // Send only while the master is proven map-local. Cross-map notifications
+    // require a separate, validated deferred-delivery design (not part of G0).
+    if (!master || !master->GetSession() || !master->IsInWorld() ||
+        master->IsBeingTeleported() || !IsBotMasteredByRequester(master, bot))
+        return;
+
+    SendAddonPacket(master, CHAT_MSG_WHISPER, "BOT_DEATH", UrlEncodeField(bot->GetName()));
 }
 // MB_BOT_RELEASE_V1_END
 // MB_QUEST_ACCEPT_ALL_V1_BEGIN
