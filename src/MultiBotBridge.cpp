@@ -5165,7 +5165,7 @@ void SendTrainerErrorPacket(Player* requester, ChatMsg replyType, std::string co
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string trainerReason;
@@ -5268,7 +5268,7 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
     if (!learnAll)
         TryParseUint32Field(requestedSpell, 1, std::numeric_limits<uint32>::max(), requestedSpellId);
 
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     if (!bot)
