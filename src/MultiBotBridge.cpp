@@ -5490,10 +5490,29 @@ std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
     return outfits;
 }
 
+Player* FindAuthorizedLocalOutfitBot(Player* requester, std::string const& botName)
+{
+    if (!requester || !requester->GetSession() || !requester->IsInWorld() ||
+        requester->IsBeingTeleported())
+        return nullptr;
+
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
+    if (!bot || !bot->GetSession() || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+        bot->GetMap() != requester->GetMap())
+        return nullptr;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return nullptr;
+
+    return bot;
+}
+
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalOutfitBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Trim(requestToken);
 
@@ -5531,7 +5550,7 @@ bool AppendOutfitFramedPacket(
 bool SendOutfitFramedPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalOutfitBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::vector<OutfitSetSnapshot> const outfits = bot ? BuildOutfitSnapshots(bot) : std::vector<OutfitSetSnapshot>();
 
@@ -9742,7 +9761,7 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
     std::string const suffix = SanitizeOutfitCommandSuffix(UrlDecodeField(encodedSuffix));
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalOutfitBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     bool const persist = persistToken == "1";
