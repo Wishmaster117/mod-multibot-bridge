@@ -3315,10 +3315,29 @@ std::string BuildStatsPayload(Player* bot)
     return out.str();
 }
 
+Player* FindAuthorizedLocalInventoryBot(Player* requester, std::string const& botName)
+{
+    if (!requester || !requester->GetSession() || !requester->IsInWorld() ||
+        requester->IsBeingTeleported())
+        return nullptr;
+
+    Player* const bot = FindLocalVisibleEquipmentBot(requester, botName);
+    if (!bot || !bot->GetSession() || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+        bot->GetMap() != requester->GetMap())
+        return nullptr;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        return nullptr;
+
+    return bot;
+}
+
 void SendInventorySnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
     SendAddonPacket(requester, replyType, "INV_BEGIN", prefixPayload);
@@ -4443,7 +4462,7 @@ void SendInventoryExactBagPacket(
 void SendInventoryExactSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
 
@@ -4782,7 +4801,7 @@ bool ConsumeGuildBankWithdrawSlot(Guild* guild, Player* player, uint8 tabId)
 void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
 
@@ -4838,7 +4857,7 @@ void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& bo
 void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
 
@@ -8073,7 +8092,7 @@ void RunInventoryItemMoveCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8214,7 +8233,7 @@ void RunInventoryItemDepositExactCommand(
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
     std::string const action = ToUpper(Trim(actionValue));
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8343,7 +8362,7 @@ void RunInventoryItemTradeCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8460,7 +8479,7 @@ void RunInventoryItemEquipCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8555,7 +8574,7 @@ void RunInventoryItemUnequipCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8654,7 +8673,7 @@ void RunInventoryItemDestroyCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8747,7 +8766,7 @@ void RunInventoryItemUseCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -8910,7 +8929,7 @@ void RunInventoryItemSellCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
@@ -9055,7 +9074,7 @@ void SendVendorBuybackPackets(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string reason;
 
@@ -9140,7 +9159,7 @@ void RunVendorBuybackCommand(
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string reason;
     bool purchased = false;
@@ -9250,7 +9269,7 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
         TryParseUint32Field(Trim(countValue), 0, kMaxItemActionCount, requestedCount);
     }
 
-    Player* const bot = FindBotByName(requester, trimmedBotName);
+    Player* const bot = FindAuthorizedLocalInventoryBot(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
     std::string reason;
