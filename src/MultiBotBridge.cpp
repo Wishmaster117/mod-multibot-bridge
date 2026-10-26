@@ -784,8 +784,8 @@ public:
                 return false;
             }
         }
-        handle_ = file;
-        size_ = truncate ? 0 : static_cast<std::uintmax_t>(size.QuadPart);
+        _handle = file;
+        _size = truncate ? 0 : static_cast<std::uintmax_t>(size.QuadPart);
 #else
         int const fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (fd < 0)
@@ -797,41 +797,41 @@ public:
             ::close(fd);
             return false;
         }
-        fd_ = fd;
-        size_ = truncate ? 0 : static_cast<std::uintmax_t>(information.st_size);
+        _fd = fd;
+        _size = truncate ? 0 : static_cast<std::uintmax_t>(information.st_size);
 #endif
         return true;
     }
 
-    std::uintmax_t Size() const { return size_; }
+    std::uintmax_t Size() const { return _size; }
 
     bool Flush()
     {
 #ifdef _WIN32
-        return handle_ != INVALID_HANDLE_VALUE; // WriteFile already sends data to the OS.
+        return _handle != INVALID_HANDLE_VALUE; // WriteFile already sends data to the OS.
 #else
-        return fd_ >= 0; // write() has no userspace stream buffer to flush.
+        return _fd >= 0; // write() has no userspace stream buffer to flush.
 #endif
     }
 
     bool Write(std::string const& data)
     {
 #ifdef _WIN32
-        if (handle_ == INVALID_HANDLE_VALUE || data.size() > std::numeric_limits<DWORD>::max())
+        if (_handle == INVALID_HANDLE_VALUE || data.size() > std::numeric_limits<DWORD>::max())
             return false;
         LARGE_INTEGER zero{};
         DWORD written = 0;
-        if (!::SetFilePointerEx(handle_, zero, nullptr, FILE_END) ||
-            !::WriteFile(handle_, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) ||
+        if (!::SetFilePointerEx(_handle, zero, nullptr, FILE_END) ||
+            !::WriteFile(_handle, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) ||
             written != data.size())
             return false;
 #else
-        if (fd_ < 0)
+        if (_fd < 0)
             return false;
         std::size_t done = 0;
         while (done < data.size())
         {
-            ssize_t const written = ::write(fd_, data.data() + done, data.size() - done);
+            ssize_t const written = ::write(_fd, data.data() + done, data.size() - done);
             if (written < 0 && errno == EINTR)
                 continue;
             if (written <= 0)
@@ -839,35 +839,35 @@ public:
             done += static_cast<std::size_t>(written);
         }
 #endif
-        size_ += data.size();
+        _size += data.size();
         return Flush();
     }
 
     void Close()
     {
 #ifdef _WIN32
-        if (handle_ != INVALID_HANDLE_VALUE)
+        if (_handle != INVALID_HANDLE_VALUE)
         {
-            ::CloseHandle(handle_);
-            handle_ = INVALID_HANDLE_VALUE;
+            ::CloseHandle(_handle);
+            _handle = INVALID_HANDLE_VALUE;
         }
 #else
-        if (fd_ >= 0)
+        if (_fd >= 0)
         {
-            ::close(fd_);
-            fd_ = -1;
+            ::close(_fd);
+            _fd = -1;
         }
 #endif
-        size_ = 0;
+        _size = 0;
     }
 
 private:
 #ifdef _WIN32
-    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    HANDLE _handle = INVALID_HANDLE_VALUE;
 #else
-    int fd_ = -1;
+    int _fd = -1;
 #endif
-    std::uintmax_t size_ = 0;
+    std::uintmax_t _size = 0;
 };
 
 // Diagnostic traffic only. All filesystem writes stay inside the configured LogsDir.
