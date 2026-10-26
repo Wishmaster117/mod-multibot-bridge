@@ -16988,6 +16988,100 @@ void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const
     SendAddonPacket(requester, replyType, "FORMATION_ACK", payload.str());
 }
 
+// MB_T4B1_GENERIC_RUN_REPLAY_V1_BEGIN
+// Protect only the generic RTI/COMBAT/POSITION/LOOT RUN handlers.
+// Separate from group-order tokens: those tokens may collide across commands.
+std::size_t constexpr kGenericRunRateLimit = 8;
+std::chrono::milliseconds constexpr kGenericRunRateWindow(2000);
+std::chrono::seconds constexpr kGenericRunReplayTtl(10);
+std::size_t constexpr kGenericRunMaxRecentTokens = 64;
+std::size_t constexpr kGenericRunMaxRequesterStates = 512;
+
+struct GenericRunGuardState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> recentTokens;
+};
+
+std::mutex sGenericRunGuardMutex;
+std::map<uint32, GenericRunGuardState> sGenericRunGuardStates;
+
+void PruneGenericRunGuardState(GenericRunGuardState& state, std::chrono::steady_clock::time_point now)
+{
+    while (!state.requests.empty() && now - state.requests.front() >= kGenericRunRateWindow)
+        state.requests.pop_front();
+    while (!state.recentTokens.empty() && now - state.recentTokens.front().second >= kGenericRunReplayTtl)
+        state.recentTokens.pop_front();
+}
+
+bool AcceptGenericRunRequest(Player* requester, char const* requestType, std::string const& token, std::string& reason)
+{
+    if (!requester || !IsValidRequestToken(token))
+    {
+        reason = "BAD_TOKEN";
+        return false;
+    }
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> const lock(sGenericRunGuardMutex);
+    uint32 const requesterKey = requester->GetGUID().GetCounter();
+    auto stateIt = sGenericRunGuardStates.find(requesterKey);
+
+    if (stateIt == sGenericRunGuardStates.end())
+    {
+        if (sGenericRunGuardStates.size() >= kGenericRunMaxRequesterStates)
+        {
+            for (auto it = sGenericRunGuardStates.begin(); it != sGenericRunGuardStates.end();)
+            {
+                PruneGenericRunGuardState(it->second, now);
+                if (it->second.requests.empty() && it->second.recentTokens.empty())
+                    it = sGenericRunGuardStates.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        if (sGenericRunGuardStates.size() >= kGenericRunMaxRequesterStates)
+        {
+            reason = "RATE_LIMIT";
+            return false;
+        }
+        stateIt = sGenericRunGuardStates.emplace(requesterKey, GenericRunGuardState{}).first;
+    }
+
+    GenericRunGuardState& state = stateIt->second;
+    PruneGenericRunGuardState(state, now);
+    if (state.requests.size() >= kGenericRunRateLimit)
+    {
+        reason = "RATE_LIMIT";
+        return false;
+    }
+    state.requests.push_back(now);
+
+    // The key is namespaced by RUN request type; each Addon command owns its counter.
+    std::string const scopedToken = std::string(requestType) + ":" + token;
+    for (auto const& entry : state.recentTokens)
+    {
+        if (entry.first == scopedToken)
+        {
+            reason = "REPLAY";
+            return false;
+        }
+    }
+
+    // Never evict a live token before its TTL expires.
+    if (state.recentTokens.size() >= kGenericRunMaxRecentTokens)
+    {
+        reason = "RATE_LIMIT";
+        return false;
+    }
+
+    state.recentTokens.push_back({scopedToken, now});
+    reason.clear();
+    return true;
+}
+// MB_T4B1_GENERIC_RUN_REPLAY_V1_END
+
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -16999,6 +17093,13 @@ void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scop
 
     if (IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
     {
+        std::string rejectionReason;
+        if (!AcceptGenericRunRequest(requester, "RTI", token, rejectionReason))
+        {
+            SendProtocolError(requester, replyType, "RUN", "RTI", token, rejectionReason);
+            return;
+        }
+
         for (Player* const bot : GetBridgeVisibleBots(requester))
         {
             if (!BotMatchesRTIScope(requester, bot, scope, target))
@@ -17030,6 +17131,13 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
 
     if (IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
+        std::string rejectionReason;
+        if (!AcceptGenericRunRequest(requester, "COMBAT", token, rejectionReason))
+        {
+            SendProtocolError(requester, replyType, "RUN", "COMBAT", token, rejectionReason);
+            return;
+        }
+
         for (Player* const bot : GetBridgeVisibleBots(requester))
         {
             if (!BotMatchesCombatScope(requester, bot, scope, target))
@@ -17061,6 +17169,13 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
 
     if (IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
+        std::string rejectionReason;
+        if (!AcceptGenericRunRequest(requester, "POSITION", token, rejectionReason))
+        {
+            SendProtocolError(requester, replyType, "RUN", "POSITION", token, rejectionReason);
+            return;
+        }
+
         for (Player* const bot : GetBridgeVisibleBots(requester))
         {
             if (!BotMatchesCombatScope(requester, bot, scope, target))
@@ -17240,6 +17355,13 @@ void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& sco
 
     if (IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
+        std::string rejectionReason;
+        if (!AcceptGenericRunRequest(requester, "LOOT", token, rejectionReason))
+        {
+            SendProtocolError(requester, replyType, "RUN", "LOOT", token, rejectionReason);
+            return;
+        }
+
         for (Player* const bot : GetBridgeVisibleBots(requester))
         {
             if (!BotMatchesCombatScope(requester, bot, scope, target))
