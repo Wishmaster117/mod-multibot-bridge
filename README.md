@@ -315,6 +315,26 @@ These endpoints keep requester/group/bot authorization, bounded fields and resul
 
 ---
 
+# Quest Progress Subscriptions
+
+The Bridge exposes `QUEST_PROGRESS_V1` for authoritative quest snapshots and `QUEST_PROGRESS_PUSH_V1` for live progress updates.
+
+Supported requests:
+
+- `GET~QUEST_PROGRESS~BotName~token`
+- `GET~QUEST_PROGRESS~BotName~token~WATCH`
+- `GET~QUEST_PROGRESS~BotName~token~UNWATCH`
+
+`WATCH` registers or refreshes a subscription and returns an initial quest progress snapshot. Subsequent updates are sent automatically when the bot's quest state changes.
+
+`UNWATCH` cancels only the requesting player's matching subscription.  The token must match the latest WATCH token registered for that bot and requester. Successful cancellation does not return a snapshot.
+
+Subscriptions are also cleaned up automatically when players disconnect, leave the group, or log out.
+
+This functionality integrates with Questie-335 without requiring modifications to the Playerbots core or MultiBot Chatless addon.
+
+---
+
 # Autogear Options
 
 Autogear uses the dedicated capability:
@@ -430,6 +450,8 @@ INVENTORY_BULK_SELL_V1
 INVENTORY_OPEN_V1
 LOOT_RULE_ITEM_V1
 QUEST_ABANDON_V1
+QUEST_PROGRESS_V1
+QUEST_PROGRESS_PUSH_V1
 TALENT_APPLY_V1
 TALENT_SPEC_APPLY_V1
 CRAFT_RECIPE_TARGET_V1
