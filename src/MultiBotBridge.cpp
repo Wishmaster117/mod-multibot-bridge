@@ -15691,7 +15691,8 @@ void ApplyPreparedAutogear(Player* requester, ChatMsg replyType,
 bool HandleAutogearRequest(Player* requester, ChatMsg replyType,
     std::vector<std::string> const& fields)
 {
-    std::string const& type = fields[0];
+    // HandleBridgeOpcode matches the request type case-insensitively, so this has to as well.
+    std::string const type = ToUpper(Trim(fields[0]));
     std::string const token = GetSafeErrorToken(fields, 1);
     std::size_t const expected = type == "AUTOGEAR_INFO" ? 3 : (type == "AUTOGEAR_PLAN" ? 6 : 2);
     if (fields.size() != expected)
